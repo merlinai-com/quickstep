@@ -1,4 +1,5 @@
 use std::{
+    marker::PhantomData,
     mem::transmute,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
@@ -62,7 +63,7 @@ impl MiniPageBuffer {
                         // create a header and mark it dead and in the free list, then add and progress the tail
                     }
                 }
-                // barrier is head
+                // barrier is the head
                 false => {
                     let free_space_words = head - tail;
                     match free_space_words >= req_size {
@@ -85,7 +86,6 @@ impl MiniPageBuffer {
                     }
                 }
             }
-            std::hint::spin_loop();
         }
         None
     }
@@ -130,11 +130,16 @@ impl MiniPageBuffer {
         let size = node_meta.size();
     }
 
-    pub fn get_meta_ref(&self, node: MiniPageIndex) -> &NodeMeta {
+    pub fn get_meta_ref<'g>(&self, node: MiniPageIndex<'g>) -> &'g NodeMeta {
         // SAFETY: MiniPageIndex was created as an index to the metadata of a valid NodeMeta
-        unsafe { transmute(self.buffer.get_unchecked(node.0 as usize)) }
+        unsafe { transmute(self.buffer.get_unchecked(node.index as usize)) }
     }
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct MiniPageIndex(pub(crate) u64);
+// pub(crate) struct MiniPageIndex(pub(crate) u64);
+pub struct MiniPageIndex<'g> {
+    //only 48 bits used
+    pub(crate) index: u64,
+    pub(crate) _marker: PhantomData<&'g ()>,
+}

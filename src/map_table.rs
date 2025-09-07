@@ -1,94 +1,372 @@
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    RwLock,
+use std::{
+    alloc::{alloc, Layout},
+    iter::Map,
+    marker::PhantomData,
+    ptr::NonNull,
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        RwLock,
+    },
 };
 
 use crate::{buffer::MiniPageIndex, types::NodeRef, SPIN_RETRIES};
 
 ///Needs to be initialised with at least one
 pub struct MapTable {
-    indirection_arr: Box<[PageEntry]>,
+    indirection_arr: NonNull<AtomicU64>,
+    /// first node in the free list,  usize::MAX if none
     next_free: AtomicUsize,
-    last_active: AtomicUsize,
+    cap: usize,
+}
+
+impl MapTable {
+    pub fn new(leaf_upper_bound: u64) -> MapTable {
+        let layout = Layout::array::<u64>(leaf_upper_bound as usize).expect("todo");
+
+        let ptr = unsafe { alloc(layout) };
+
+        let arr = match NonNull::new(ptr as *mut AtomicU64) {
+            Some(p) => p,
+            None => todo!("todo: handle OOM"),
+        };
+
+        MapTable {
+            indirection_arr: arr,
+            next_free: AtomicUsize::new(usize::MAX),
+            cap: leaf_upper_bound as usize,
+        }
+    }
 }
 
 impl MapTable {
     pub fn create_page_entry(&self, node: MiniPageIndex) -> PageWriteGuard {
         let target_idx = self.next_free.fetch_add(1, Ordering::AcqRel);
 
-        let val = PageEntry::new(node);
+        if target_idx >= self.cap {
+            todo!("handle excessive pages")
+        }
 
-        let target_ptr = &self.indirection_arr[target_idx] as *const PageEntry as *mut PageEntry;
-        // we haven't moved the active pointer, so nobody else can access this value
+        let val = PageEntry::new_write_locked(node);
+
+        // We have exclusive access, as the end pointer has been advanced, but the page id hasn't been returned
         unsafe {
-            target_ptr.write(val);
+            self.indirection_arr
+                .offset(target_idx as isize)
+                .write(AtomicU64::new(val.clone().to_repr()));
         }
 
-        let prev = target_idx - 1;
-        for _ in 0..SPIN_RETRIES {
-            match self.last_active.compare_exchange_weak(
-                prev,
-                target_idx,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return PageWriteGuard {
-                        map_table: self,
-                        index: target_idx,
-                        node: NodeRef::MiniPage(node),
-                    }
-                }
-                Err(_) => std::hint::spin_loop(),
-            }
+        PageWriteGuard {
+            map_table: self,
+            page: PageId(target_idx as u64),
+            node: val,
         }
 
-        todo!("Handle case where we did too many retries")
+        // let prev = target_idx - 1;
+        // for _ in 0..SPIN_RETRIES {
+        //     match self.last_active.compare_exchange_weak(
+        //         prev,
+        //         target_idx,
+        //         Ordering::AcqRel,
+        //         Ordering::Acquire,
+        //     ) {
+        //         Ok(_) => {
+        //             return PageWriteGuard {
+        //                 map_table: self,
+        //                 index: target_idx,
+        //                 node: NodeRef::MiniPage(node),
+        //             }
+        //         }
+        //         Err(_) => std::hint::spin_loop(),
+        //     }
+        // }
+
+        // todo!("Handle case where we did too many retries")
     }
 
     pub fn read_page_entry(&self, page: PageId) -> PageReadGuard {
+        let entry_ref = self.get_ref(page);
+        let mut entry = PageEntry::from_repr(entry_ref.load(Ordering::Acquire));
+
+        for _ in 0..SPIN_RETRIES {
+            if entry.pending_write() {
+                std::hint::spin_loop();
+                continue;
+            }
+
+            let lock_state = entry.state();
+
+            if lock_state >= WRITE_LOCK_STATE {
+                // Write lock is currently held
+                std::hint::spin_loop();
+                entry = PageEntry(entry_ref.load(Ordering::Acquire));
+            } else {
+                // Reader locked or unlocked
+
+                let new = entry.clone().set_state(lock_state + 1);
+
+                match entry_ref.compare_exchange_weak(
+                    entry.to_repr(),
+                    new.to_repr(),
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(e) => {
+                        return PageReadGuard {
+                            map_table: self,
+                            page,
+                            node: PageEntry(e),
+                        }
+                    }
+                    Err(e) => entry = PageEntry(e),
+                }
+            }
+        }
+
         todo!()
     }
 
     pub fn write_page_entry(&self, page: PageId) -> PageWriteGuard {
+        let entry_ref = self.get_ref(page);
+        let mut entry = PageEntry(entry_ref.load(Ordering::Acquire));
+
+        for _ in 0..SPIN_RETRIES {
+            let lock_state = entry.state();
+            match lock_state {
+                0 => {
+                    let new = entry
+                        .clone()
+                        .set_state(WRITE_LOCK_STATE)
+                        .set_pending_write(false);
+                    match entry_ref.compare_exchange_weak(
+                        entry.to_repr(),
+                        new.to_repr(),
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(e) => {
+                            return PageWriteGuard {
+                                map_table: self,
+                                page,
+                                node: PageEntry(e),
+                            }
+                        }
+                        Err(e) => entry = PageEntry(e),
+                    }
+                }
+                _ => {
+                    if !entry.pending_write() {
+                        let new = entry.clone().set_pending_write(true);
+                        entry_ref.compare_exchange_weak(
+                            entry.to_repr(),
+                            new.to_repr(),
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+                    }
+
+                    std::hint::spin_loop();
+                    entry = PageEntry(entry_ref.load(Ordering::Acquire));
+                }
+            }
+        }
+
+        todo!()
+    }
+
+    fn get_ref(&self, page: PageId) -> &AtomicU64 {
+        // Safety pageid was created pointing to a valid entry
+        unsafe { self.indirection_arr.offset(page.0 as isize).as_ref() }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct PageId(pub(crate) u64);
+
+pub struct PageReadGuard<'a> {
+    map_table: &'a MapTable,
+    page: PageId,
+    node: PageEntry,
+}
+
+impl<'a> PageReadGuard<'a> {
+    pub fn node<'g>(&'g self) -> NodeRef<'g> {
+        self.node.get_ref()
+    }
+}
+
+impl<'a> PageReadGuard<'a> {
+    pub fn upgrade(self) -> PageWriteGuard<'a> {
+        let map_table = self.map_table;
+        let page = self.page;
+        let node = self.node.clone();
+
+        std::mem::forget(self);
+
+        let entry_ref = map_table.get_ref(page);
+        let mut entry = PageEntry(entry_ref.load(Ordering::Relaxed));
+        for _ in 0..SPIN_RETRIES {
+            match entry.state() {
+                // 1 means that we're the only reader, so we can upgrade to writer
+                1 => {
+                    let new = entry.clone().set_state(WRITE_LOCK_STATE);
+                    // not weak because we don't want someone else to intercept
+                    match entry_ref.compare_exchange(
+                        entry.to_repr(),
+                        new.to_repr(),
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => {
+                            return PageWriteGuard {
+                                map_table,
+                                page,
+                                node,
+                            }
+                        }
+                        Err(e) => entry = PageEntry(e),
+                    }
+                }
+                _ => {
+                    std::hint::spin_loop();
+                    entry = PageEntry(entry_ref.load(Ordering::Relaxed));
+                }
+            }
+        }
+
         todo!()
     }
 }
 
-pub struct PageId(u64);
-
-pub struct PageReadGuard<'a> {
-    map_table: &'a MapTable,
-    index: usize,
-    pub node: NodeRef,
-}
-
 impl<'a> Drop for PageReadGuard<'a> {
     fn drop(&mut self) {
-        todo!("decrement writer lock")
+        let entry_ref = self.map_table.get_ref(self.page);
+        let mut entry = PageEntry(entry_ref.load(Ordering::Relaxed));
+
+        loop {
+            let old_state = entry.state();
+            let new = entry.clone().set_state(old_state - 1);
+            match entry_ref.compare_exchange_weak(
+                entry.to_repr(),
+                new.to_repr(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(e) => entry = PageEntry(e),
+            }
+        }
     }
 }
 
 pub struct PageWriteGuard<'a> {
     map_table: &'a MapTable,
-    index: usize,
-    pub node: NodeRef,
+    page: PageId,
+    node: PageEntry,
+}
+
+impl<'a> PageWriteGuard<'a> {
+    pub fn node<'g>(&'g self) -> NodeRef<'g> {
+        self.node.get_ref()
+    }
+}
+
+impl<'a> PageWriteGuard<'a> {
+    /// Downgrade a write guard to a readguard, this should only be used after copy-on-access or
+    pub fn downgrade(self) -> PageReadGuard<'a> {
+        let map_table = self.map_table;
+        let page = self.page;
+        let node = self.node.clone();
+
+        std::mem::forget(self);
+
+        let entry_ref = map_table.get_ref(page);
+        let entry = PageEntry(entry_ref.load(Ordering::Relaxed));
+        let entry = entry.set_state(1);
+
+        // Blind write is fine because we had write lock
+        // the only concurrent modification could be setting writer pending
+        entry_ref.store(entry.to_repr(), Ordering::Release);
+
+        todo!()
+    }
 }
 
 impl<'a> Drop for PageWriteGuard<'a> {
     fn drop(&mut self) {
-        todo!("release writer lock")
+        let entry_ref = self.map_table.get_ref(self.page);
+        let mut entry = PageEntry(entry_ref.load(Ordering::Relaxed));
+
+        loop {
+            let new = entry.clone().set_state(0);
+            match entry_ref.compare_exchange_weak(
+                entry.to_repr(),
+                new.to_repr(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(e) => entry = PageEntry(e),
+            }
+        }
     }
 }
 
-/// | address |
+/// | address | is_leaf | write pending | lock state
+///     48b      1b           1b            14b
+// TODO: option to wait on two 32bit parts using futex
+#[derive(Clone)]
 #[repr(transparent)]
 struct PageEntry(u64);
 
+const WRITE_LOCK_STATE: u16 = (1 << 14) - 1;
+const _: () = assert!(WRITE_LOCK_STATE.count_ones() == 14);
+
 impl PageEntry {
-    fn new(node: MiniPageIndex) -> PageEntry {
-        let repr = node.0 << 16;
-        // TODO: add writer bit, so its created in an exlusive locked state
-        PageEntry(repr)
+    fn new_write_locked<'g>(node: MiniPageIndex<'g>) -> PageEntry {
+        let repr = node.index << 16;
+        PageEntry(repr).set_state(WRITE_LOCK_STATE)
+    }
+
+    fn to_repr(self) -> u64 {
+        self.0
+    }
+
+    fn from_repr(val: u64) -> PageEntry {
+        PageEntry(val)
+    }
+
+    fn get_ref(&self) -> NodeRef {
+        let repr = self.0;
+
+        let is_leaf = (repr >> 15) & 1 == 1;
+        let addr = repr >> 16;
+
+        match is_leaf {
+            true => NodeRef::Leaf(addr),
+            false => NodeRef::MiniPage(MiniPageIndex {
+                index: addr,
+                _marker: std::marker::PhantomData,
+            }),
+        }
+    }
+
+    fn state(&self) -> u16 {
+        self.0 as u16 & WRITE_LOCK_STATE
+    }
+
+    fn set_state(mut self, new_state: u16) -> PageEntry {
+        const CLEAR_MASK: u64 = !(WRITE_LOCK_STATE as u64);
+        self.0 = (self.0 & CLEAR_MASK) | new_state as u64;
+        self
+    }
+
+    fn pending_write(&self) -> bool {
+        ((self.0 >> 14) & 1) == 1
+    }
+
+    fn set_pending_write(mut self, new: bool) -> PageEntry {
+        self.0 &= !(1 << 14);
+        self.0 |= (new as u64) << 14;
+        self
     }
 }

@@ -27,7 +27,7 @@ impl KVMeta {
 
     #[inline]
     pub fn typ(&self) -> KVRecordType {
-        (self.0 << 44) >> 62
+        unsafe { transmute(((self.0 << 44) >> 62) as u8) }
     }
 
     #[inline]
@@ -58,6 +58,7 @@ impl KVMeta {
 // | TOMBSTONE |  true  |  false  |
 // | PHANTOM   |  false |  false  |
 // +-----------+--------+---------+
+#[repr(u8)]
 pub enum KVRecordType {
     Insert = 0b11,
     Cache = 0b01,
@@ -120,6 +121,8 @@ impl NodeSize {
 }
 
 // TODO: if there are bits spare, seperate size from mini-node/ leaf
+/// Metadata of a leaf or mini-page
+/// INVARIANT: a reference to this must be part of a valid mini-page or leaf
 /// | Leaf | size | padding | live | split | record count
 ///   48b  |  3b  |   2b    | 1b   |   1b  |      9b
 /// Note: each record must take up at least 8 bytes, owing to the metadata, so there can only be 512/page
@@ -128,13 +131,13 @@ impl NodeSize {
 pub struct NodeMeta(u64);
 
 impl NodeMeta {
-    pub unsafe fn from_repr(repr: u64) -> NodeMeta {
-        NodeMeta(repr)
-    }
+    // pub unsafe fn from_repr(repr: u64) -> NodeMeta {
+    //     NodeMeta(repr)
+    // }
 
-    pub fn to_repr(self) -> u64 {
-        self.0
-    }
+    // pub fn to_repr(self) -> u64 {
+    //     self.0
+    // }
 }
 
 impl NodeMeta {
@@ -150,13 +153,17 @@ impl NodeMeta {
         const RECORD_COUNT_MASK: u64 = 0x0000_0000_0000_01FF;
         (self.0 & RECORD_COUNT_MASK) as u16
     }
+
+    pub fn leaf(&self) -> u64 {
+        self.0 >> 16
+    }
 }
 
 // Idea: use this layout, and use a macro for match, a la congee
 // | padding | address | type |
 // |   15b   |   48b   |  1b  |
-
-pub enum NodeRef {
+#[derive(Clone)]
+pub enum NodeRef<'g> {
     Leaf(u64),
-    MiniPage(MiniPageIndex),
+    MiniPage(MiniPageIndex<'g>),
 }

@@ -3,22 +3,18 @@ use std::{mem::transmute, path::Prefix, ptr::slice_from_raw_parts, slice};
 use crate::types::{KVMeta, NodeMeta};
 
 impl NodeMeta {
-    /// This must be called on a NodeMeta at the start of a correctly sized mini-page or leaf
-    pub unsafe fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        let record_cnt = self.record_count();
+    #[inline]
+    pub fn get_kv_meta(&self, kv_index: usize) -> KVMeta {
+        let kv_meta_start = unsafe { transmute::<_, *const KVMeta>(self).offset(1) };
+        debug_assert!(kv_index < self.record_count() as usize);
+        unsafe { kv_meta_start.offset(kv_index as isize).read() }
+    }
 
-        debug_assert!(
-            record_cnt > 3,
-            "There should always be two fences and at least one real entry"
-        );
-
-        let kv_meta_start = transmute::<_, *const KVMeta>(self).offset(1);
-        // let kv_meta_arr = slice_from_raw_parts(kv_meta_start, record_cnt as usize);
-
-        let low_fence_meta = kv_meta_start.read();
+    pub fn get_node_prefix(&self) -> &[u8] {
+        let low_fence_meta = self.get_kv_meta(0);
         let low_fence_key = self.get_key_from_meta(low_fence_meta);
 
-        let high_fence_meta = kv_meta_start.offset(record_cnt as isize - 1).read();
+        let high_fence_meta = self.get_kv_meta(self.record_count() as usize - 1);
         let high_fence_key = self.get_key_from_meta(high_fence_meta);
 
         let prefix_len = low_fence_key
@@ -28,20 +24,21 @@ impl NodeMeta {
             .count();
 
         let prefix = &low_fence_key[0..prefix_len];
-        debug_assert!(
-            key.starts_with(prefix),
-            "the target key should share the common prefix, if its made it this far"
-        );
+        prefix
+    }
 
+    #[inline]
+    pub fn binary_search(&self, prefix_len: usize, key: &[u8]) -> Result<usize, usize> {
         let target_lookahead = &key[prefix_len];
-        let target_lookahead = transmute::<_, &u16>(target_lookahead);
+
+        // TODO: check how this interacts with endianness
+        let target_lookahead = unsafe { transmute::<_, &u16>(target_lookahead) };
 
         let mut lower = 1usize;
-        let mut upper = record_cnt as usize - 1;
-
+        let mut upper = self.record_count() as usize - 1;
         while upper > lower {
             let mid = lower.midpoint(upper);
-            let mid_kv = kv_meta_start.offset(mid as isize).read();
+            let mid_kv = self.get_kv_meta(mid);
 
             let mid_lookahead = mid_kv.look_ahead();
 
@@ -57,7 +54,7 @@ impl NodeMeta {
 
                     match key.cmp(mid_key) {
                         std::cmp::Ordering::Less => upper = mid - 1,
-                        std::cmp::Ordering::Equal => return Some(self.get_key_from_meta(mid_kv)),
+                        std::cmp::Ordering::Equal => return Ok(mid),
                         std::cmp::Ordering::Greater => lower = mid + 1,
                     }
                 }
@@ -67,26 +64,32 @@ impl NodeMeta {
                 }
             }
         }
-
-        None
+        Err(lower)
     }
 
-    unsafe fn get_key_from_meta(&self, kv: KVMeta) -> &[u8] {
-        let base_ptr = transmute::<_, *const u8>(self);
+    #[inline]
+    pub fn get_key_from_meta(&self, kv: KVMeta) -> &[u8] {
+        let base_ptr = self.get_base_ptr();
 
         let offset = kv.offset() as isize;
         let len = kv.key_size() as usize;
 
-        slice::from_raw_parts(base_ptr.offset(offset), len)
+        unsafe { slice::from_raw_parts(base_ptr.offset(offset), len) }
     }
 
-    unsafe fn get_val_from_meta(&self, kv: KVMeta) -> &[u8] {
-        let base_ptr = transmute::<_, *const u8>(self);
+    #[inline]
+    pub fn get_val_from_meta(&self, kv: KVMeta) -> &[u8] {
+        let base_ptr = self.get_base_ptr();
 
         let offset = kv.offset() as isize;
         let key_len = kv.key_size() as isize;
         let val_len = kv.val_size() as usize;
 
-        slice::from_raw_parts(base_ptr.offset(offset + key_len), val_len)
+        unsafe { slice::from_raw_parts(base_ptr.offset(offset + key_len), val_len) }
+    }
+
+    #[inline]
+    fn get_base_ptr(&self) -> *const u8 {
+        self as *const NodeMeta as *const u8
     }
 }

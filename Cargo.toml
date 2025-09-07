@@ -8,3 +8,4 @@ homepage = "https://github.com/raphaeldarley/quickstip"
 repository = "https://github.com/raphaeldarley/quickstep"
 
 [dependencies]
+fastrand = "2.3.0"
