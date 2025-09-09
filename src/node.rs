@@ -3,6 +3,22 @@ use std::{mem::transmute, path::Prefix, ptr::slice_from_raw_parts, slice};
 use crate::types::{KVMeta, NodeMeta};
 
 impl NodeMeta {
+    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        let target_kv = self.binary_search(self.get_node_prefix().len(), key).ok()?;
+
+        let target_kv = self.get_kv_meta(target_kv);
+
+        match target_kv.typ().exists() {
+            true => {
+                let val = self.get_val_from_meta(target_kv);
+                Some(val)
+            }
+            false => None,
+        }
+    }
+}
+
+impl NodeMeta {
     #[inline]
     pub fn get_kv_meta(&self, kv_index: usize) -> KVMeta {
         let kv_meta_start = unsafe { transmute::<_, *const KVMeta>(self).offset(1) };
@@ -28,6 +44,7 @@ impl NodeMeta {
     }
 
     #[inline]
+    ///Find the location a key would be in the
     pub fn binary_search(&self, prefix_len: usize, key: &[u8]) -> Result<usize, usize> {
         let target_lookahead = &key[prefix_len];
 

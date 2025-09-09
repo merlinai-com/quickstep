@@ -184,7 +184,7 @@ pub struct PageId(pub(crate) u64);
 
 pub struct PageReadGuard<'a> {
     map_table: &'a MapTable,
-    page: PageId,
+    pub page: PageId,
     node: PageEntry,
 }
 
@@ -260,7 +260,7 @@ impl<'a> Drop for PageReadGuard<'a> {
 
 pub struct PageWriteGuard<'a> {
     map_table: &'a MapTable,
-    page: PageId,
+    pub page: PageId,
     node: PageEntry,
 }
 
@@ -268,6 +268,12 @@ impl<'a> PageWriteGuard<'a> {
     pub fn node<'g>(&'g self) -> NodeRef<'g> {
         self.node.get_ref()
     }
+}
+
+impl<'a> PageWriteGuard<'a> {
+    /// Cache the given key and value, without doing any resizing
+    /// This should not invalidate any existing slices into the Node
+    pub fn cache_no_alloc(&mut self, key: &[u8], value: &[u8]) {}
 }
 
 impl<'a> PageWriteGuard<'a> {
@@ -287,7 +293,11 @@ impl<'a> PageWriteGuard<'a> {
         // the only concurrent modification could be setting writer pending
         entry_ref.store(entry.to_repr(), Ordering::Release);
 
-        todo!()
+        PageReadGuard {
+            map_table,
+            page,
+            node,
+        }
     }
 }
 
@@ -316,7 +326,7 @@ impl<'a> Drop for PageWriteGuard<'a> {
 // TODO: option to wait on two 32bit parts using futex
 #[derive(Clone)]
 #[repr(transparent)]
-struct PageEntry(u64);
+pub struct PageEntry(u64);
 
 const WRITE_LOCK_STATE: u16 = (1 << 14) - 1;
 const _: () = assert!(WRITE_LOCK_STATE.count_ones() == 14);
@@ -335,7 +345,7 @@ impl PageEntry {
         PageEntry(val)
     }
 
-    fn get_ref(&self) -> NodeRef {
+    pub fn get_ref(&self) -> NodeRef {
         let repr = self.0;
 
         let is_leaf = (repr >> 15) & 1 == 1;
@@ -350,7 +360,7 @@ impl PageEntry {
         }
     }
 
-    fn state(&self) -> u16 {
+    pub fn state(&self) -> u16 {
         self.0 as u16 & WRITE_LOCK_STATE
     }
 

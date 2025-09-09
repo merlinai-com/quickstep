@@ -5,6 +5,7 @@ use crate::{
     buffer::MiniPageBuffer,
     error::QSError,
     io_engine::IoEngine,
+    lock_manager::LockManager,
     map_table::{MapTable, PageReadGuard},
 };
 
@@ -12,6 +13,7 @@ pub mod btree;
 pub mod buffer;
 pub mod error;
 pub mod io_engine;
+pub mod lock_manager;
 pub mod map_table;
 pub mod node;
 pub mod page_op;
@@ -43,29 +45,38 @@ impl QuickStep {
     }
 
     pub fn tx(&self) -> QuickStepTx {
-        QuickStepTx { db: self }
+        QuickStepTx {
+            db: self,
+            lock_manager: LockManager::new(),
+        }
     }
 }
 
 pub struct QuickStepTx<'db> {
     db: &'db QuickStep,
-    read_locks: Vec<PageReadGuard>,
-    write_locks: Vec,
+    lock_manager: LockManager<'db>,
     // changes for rollback
 }
 
 impl<'db> QuickStepTx<'db> {
-    pub fn get<'tx>(&'tx self, key: &[u8]) -> Result<Option<&'tx [u8]>, QSError> {
+    /// Get a value
+    pub fn get<'tx>(&'tx mut self, key: &[u8]) -> Result<Option<&'tx [u8]>, QSError> {
         let page = self.db.inner_nodes.read_traverse_leaf(key);
 
-        // lock_manager get or upgrade
+        let page_guard = self
+            .lock_manager
+            .get_or_acquire_read_lock(&self.db.map_table, page)?;
 
-        let page_guard = self.db.map_table.read_page_entry(page);
-
-        let res = page_guard.get(&self.db.cache, &self.db.io_engine, key);
-
-        // TODO: add page_guard to lock_manager
+        let res = page_guard.get(&self.db.cache, &self.db.io_engine, key)?;
 
         Ok(res)
+    }
+
+    /// Insert a value that does not already exist
+    pub fn insert<'tx>(&'tx mut self, key: &[u8]) -> Result<(), QSError> {
+        // find leaf, keep track of those that would need to be written to in a split
+        //
+
+        todo!()
     }
 }

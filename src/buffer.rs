@@ -119,7 +119,7 @@ impl MiniPageBuffer {
     pub fn evict(&self) {}
 
     /// Deallocate a mini-page, this mini-page must be unused, ie. not appear in the mapping table
-    pub fn dealloc(&self, node: MiniPageIndex) {
+    pub unsafe fn dealloc(&self, node: MiniPageIndex) {
         let node_meta: &NodeMeta = self.get_meta_ref(node);
 
         // if its in the second chance region, there's no point adding it to a free list
@@ -130,9 +130,20 @@ impl MiniPageBuffer {
         let size = node_meta.size();
     }
 
-    pub fn get_meta_ref<'g>(&self, node: MiniPageIndex<'g>) -> &'g NodeMeta {
+    /// SAFETY: caller must guarentee that a mutable reference does not exist
+    pub unsafe fn get_meta_ref<'g>(&self, node: MiniPageIndex<'g>) -> &'g NodeMeta {
         // SAFETY: MiniPageIndex was created as an index to the metadata of a valid NodeMeta
-        unsafe { transmute(self.buffer.get_unchecked(node.index as usize)) }
+        unsafe {
+            &*(self.buffer.get_unchecked(node.index as usize) as *const u64 as *const NodeMeta)
+        }
+    }
+
+    /// SAFETY: caller must guarentee that no other references exist
+    pub unsafe fn get_meta_mut<'g>(&self, node: MiniPageIndex<'g>) -> &'g mut NodeMeta {
+        // SAFETY: MiniPageIndex was created as an index to the metadata of a valid NodeMeta
+        unsafe {
+            &mut *(self.buffer.get_unchecked(node.index as usize) as *const u64 as *mut NodeMeta)
+        }
     }
 }
 
