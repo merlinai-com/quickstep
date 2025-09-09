@@ -9,7 +9,7 @@ use std::{
     },
 };
 
-use crate::{buffer::MiniPageIndex, types::NodeRef, SPIN_RETRIES};
+use crate::{buffer::MiniPageIndex, error::QSError, types::NodeRef, SPIN_RETRIES};
 
 ///Needs to be initialised with at least one
 pub struct MapTable {
@@ -60,30 +60,9 @@ impl MapTable {
             page: PageId(target_idx as u64),
             node: val,
         }
-
-        // let prev = target_idx - 1;
-        // for _ in 0..SPIN_RETRIES {
-        //     match self.last_active.compare_exchange_weak(
-        //         prev,
-        //         target_idx,
-        //         Ordering::AcqRel,
-        //         Ordering::Acquire,
-        //     ) {
-        //         Ok(_) => {
-        //             return PageWriteGuard {
-        //                 map_table: self,
-        //                 index: target_idx,
-        //                 node: NodeRef::MiniPage(node),
-        //             }
-        //         }
-        //         Err(_) => std::hint::spin_loop(),
-        //     }
-        // }
-
-        // todo!("Handle case where we did too many retries")
     }
 
-    pub fn read_page_entry(&self, page: PageId) -> PageReadGuard {
+    pub fn read_page_entry(&self, page: PageId) -> Result<PageReadGuard, QSError> {
         let entry_ref = self.get_ref(page);
         let mut entry = PageEntry::from_repr(entry_ref.load(Ordering::Acquire));
 
@@ -111,21 +90,21 @@ impl MapTable {
                     Ordering::Relaxed,
                 ) {
                     Ok(e) => {
-                        return PageReadGuard {
+                        return Ok(PageReadGuard {
                             map_table: self,
                             page,
                             node: PageEntry(e),
-                        }
+                        })
                     }
                     Err(e) => entry = PageEntry(e),
                 }
             }
         }
 
-        todo!()
+        Err(QSError::PageLockFail)
     }
 
-    pub fn write_page_entry(&self, page: PageId) -> PageWriteGuard {
+    pub fn write_page_entry(&self, page: PageId) -> Result<PageWriteGuard, QSError> {
         let entry_ref = self.get_ref(page);
         let mut entry = PageEntry(entry_ref.load(Ordering::Acquire));
 
@@ -144,11 +123,11 @@ impl MapTable {
                         Ordering::Relaxed,
                     ) {
                         Ok(e) => {
-                            return PageWriteGuard {
+                            return Ok(PageWriteGuard {
                                 map_table: self,
                                 page,
                                 node: PageEntry(e),
-                            }
+                            })
                         }
                         Err(e) => entry = PageEntry(e),
                     }
@@ -156,21 +135,25 @@ impl MapTable {
                 _ => {
                     if !entry.pending_write() {
                         let new = entry.clone().set_pending_write(true);
-                        entry_ref.compare_exchange_weak(
-                            entry.to_repr(),
-                            new.to_repr(),
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                        );
+                        let ev = entry_ref
+                            .compare_exchange_weak(
+                                entry.to_repr(),
+                                new.to_repr(),
+                                Ordering::Relaxed,
+                                Ordering::Relaxed,
+                            )
+                            .unwrap_or_else(|e| e);
+                        entry = PageEntry(ev);
+                        continue;
                     }
 
                     std::hint::spin_loop();
-                    entry = PageEntry(entry_ref.load(Ordering::Acquire));
+                    entry = PageEntry(entry_ref.load(Ordering::Relaxed));
                 }
             }
         }
 
-        todo!()
+        Err(QSError::PageLockFail)
     }
 
     fn get_ref(&self, page: PageId) -> &AtomicU64 {
@@ -273,7 +256,9 @@ impl<'a> PageWriteGuard<'a> {
 impl<'a> PageWriteGuard<'a> {
     /// Cache the given key and value, without doing any resizing
     /// This should not invalidate any existing slices into the Node
-    pub fn cache_no_alloc(&mut self, key: &[u8], value: &[u8]) {}
+    pub fn cache_no_alloc(&mut self, key: &[u8], value: &[u8]) {
+        todo!()
+    }
 }
 
 impl<'a> PageWriteGuard<'a> {

@@ -142,7 +142,7 @@ impl MiniPageBuffer {
     pub unsafe fn get_meta_mut<'g>(&self, node: MiniPageIndex<'g>) -> &'g mut NodeMeta {
         // SAFETY: MiniPageIndex was created as an index to the metadata of a valid NodeMeta
         unsafe {
-            &mut *(self.buffer.get_unchecked(node.index as usize) as *const u64 as *mut NodeMeta)
+            &mut *(self.buffer.as_ptr().add(node.index as usize) as *mut u64 as *mut NodeMeta)
         }
     }
 }

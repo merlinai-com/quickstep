@@ -27,7 +27,7 @@ impl<'a> LockManager<'a> {
     ) -> Result<&mut PageGuard<'a>, QSError> {
         // I tried entries, but couldn't get the lifetimes to work
         if !self.locks.contains_key(&page.0) {
-            let guard: PageReadGuard<'a> = mapping_table.read_page_entry(page);
+            let guard: PageReadGuard<'a> = mapping_table.read_page_entry(page)?;
 
             self.locks.insert(
                 page.0,
