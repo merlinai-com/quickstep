@@ -1,7 +1,15 @@
-pub trait HackLifetime {
-    unsafe fn extend_lifetime<'a, 'b>(&'a self) -> &'b Self {
-        std::mem::transmute(self)
-    }
+pub fn store_u48(val: u64) -> [u8; 6] {
+    todo!()
 }
 
-impl<T> HackLifetime for &T where T: ?Sized {}
+pub fn extract_u48(val: *const u8) -> u64 {
+    todo!()
+}
+
+pub fn store_u32(val: u64) -> [u8; 8] {
+    todo!()
+}
+
+pub fn extract_u32(val: *const u8) -> u32 {
+    todo!()
+}

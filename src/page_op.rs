@@ -1,10 +1,7 @@
 use crate::error::QSError;
 use crate::io_engine::{DiskLeaf, IoEngine};
-use crate::lock_manager::{GuardWrapper, PageGuard};
-use crate::map_table::PageReadGuard;
-use crate::rand::rand_for_cache;
-use crate::types::NodeMeta;
-use crate::utils::HackLifetime;
+use crate::lock_manager::{GuardWrapper, PageGuard, WritePageGuard};
+
 use crate::{buffer::MiniPageBuffer, types::NodeRef};
 
 impl<'a> PageGuard<'a> {
@@ -14,7 +11,7 @@ impl<'a> PageGuard<'a> {
         io: &IoEngine,
         key: &[u8],
     ) -> Result<Option<&'g [u8]>, QSError> {
-        let node = match &mut self.guard_inner {
+        let node = match &self.guard_inner {
             GuardWrapper::Write(g) => g.node(),
             GuardWrapper::Read(g) => g.node(),
         };
@@ -68,6 +65,60 @@ impl<'a> PageGuard<'a> {
         //         GuardWrapper::Read(page_read_guard) => todo!(),
         //     }
         // };
+
+        Ok(val)
+    }
+}
+
+impl<'tx, 'a> WritePageGuard<'tx, 'a> {
+    pub fn try_put(
+        &'tx mut self,
+        cache: &MiniPageBuffer,
+        io: &IoEngine,
+        key: &[u8],
+        val: &[u8],
+    ) -> Result<Option<&'tx [u8]>, QSError> {
+        let write_guard = match &mut self.0.guard_inner {
+            GuardWrapper::Write(g) => g,
+            GuardWrapper::Read(g) => {
+                unreachable!("WritePageGuard guarentees that we hold a write guard")
+            }
+        };
+
+        let node = write_guard.node();
+
+        let val = match node {
+            NodeRef::Leaf(addr) => {
+                // let size =
+
+                // let leaf = ensure_page(io, &mut self.leaf, addr)?;
+                // leaf.as_ref().get(key)
+            }
+            NodeRef::MiniPage(mini_page_index) => {
+                // SAFETY: we have either a read or write lock
+                let node_meta = unsafe { cache.get_meta_ref(mini_page_index) };
+                let prefix = node_meta.get_node_prefix();
+                match node_meta
+                    .binary_search(prefix.len(), key)
+                    .map(|i| node_meta.get_kv_meta(i))
+                {
+                    Ok(kv) => {
+                        let val = match kv.typ().exists() {
+                            true => Some(node_meta.get_key_from_meta(kv)),
+                            false => None,
+                        };
+                        // Value is already cached, so early return
+                        return Ok(val);
+                    }
+                    Err(_) => {}
+                }
+
+                let leaf_addr = node_meta.leaf();
+                let leaf = ensure_page(io, &mut self.leaf, leaf_addr)?;
+
+                leaf.as_ref().get(key)
+            }
+        };
 
         Ok(val)
     }

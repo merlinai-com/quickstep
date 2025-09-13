@@ -61,7 +61,7 @@ pub struct QuickStepTx<'db> {
 impl<'db> QuickStepTx<'db> {
     /// Get a value
     pub fn get<'tx>(&'tx mut self, key: &[u8]) -> Result<Option<&'tx [u8]>, QSError> {
-        let page = self.db.inner_nodes.read_traverse_leaf(key);
+        let page = self.db.inner_nodes.read_traverse_leaf(key)?.page;
 
         let page_guard = self
             .lock_manager
@@ -72,11 +72,21 @@ impl<'db> QuickStepTx<'db> {
         Ok(res)
     }
 
-    /// Insert a value that does not already exist
-    pub fn insert<'tx>(&'tx mut self, key: &[u8]) -> Result<(), QSError> {
+    /// Insert or update a value
+    pub fn put<'tx>(&'tx mut self, key: &[u8]) -> Result<(), QSError> {
         // find leaf, keep track of those that would need to be written to in a split
-        //
+        let res = self.db.inner_nodes.read_traverse_leaf(key)?;
+
+        let page_guard = self
+            .lock_manager
+            .get_upgrade_or_acquire_write_lock(&self.db.map_table, res.page)?;
+
+        // check if
 
         todo!()
     }
+
+    pub fn abort(self) {}
+
+    pub fn commit(self) {}
 }

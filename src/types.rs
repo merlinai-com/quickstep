@@ -16,13 +16,32 @@ impl KVMeta {
     }
 
     #[inline]
+    pub fn set_key_size(&mut self, key_size: u16) {
+        todo!()
+    }
+
+    #[inline]
     pub fn val_size(&self) -> u64 {
         (self.0 << 14) >> 50
     }
 
     #[inline]
-    pub fn offset(&self) -> u64 {
-        (self.0 << 28) >> 48
+    pub fn set_val_size(&mut self, val_size: u16) {
+        todo!()
+    }
+
+    #[inline]
+    pub fn offset(&self) -> usize {
+        ((self.0 << 28) >> 48) as usize
+    }
+
+    #[inline]
+    pub fn set_offset(&mut self, offset: u16) {
+        const OFFSET_MAST: u64 = { (u16::MAX as u64) << 20 };
+
+        // clear offset bits
+        self.0 &= !OFFSET_MAST;
+        self.0 |= (offset as u64) << 20;
     }
 
     #[inline]

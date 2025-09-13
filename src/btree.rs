@@ -1,25 +1,30 @@
 use std::{
     alloc::{alloc, Layout},
+    hint::spin_loop,
     marker::PhantomData,
-    num::{NonZero, NonZeroU16},
+    num::NonZeroU16,
     ptr::NonNull,
-    sync::{
-        atomic::{AtomicU32, AtomicU64, Ordering},
-        RwLock,
-    },
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
     u32, u64,
 };
 
-use crate::{map_table::PageId, types::NodeSize, SPIN_RETRIES};
+use crate::{
+    error::QSError,
+    map_table::PageId,
+    utils::{extract_u32, extract_u48},
+    SPIN_RETRIES,
+};
 
 /// Max length of key in bytes
 const MAX_KEY_LENGTH: usize = 64;
 
+// TODO: prevent race condition when freeing nodes
 pub struct BPTree {
-    slab: NonNull<u8>,
+    slab: NonNull<BPNode>,
     cap: u32,
     /// level | node id
-    root: AtomicU64,
+    root: u64,
+    root_vlock: AtomicU64,
     next_free: AtomicU32,
     free_list: AtomicU32,
 }
@@ -30,7 +35,7 @@ impl BPTree {
 
         let layout = Layout::from_size_align(memory_req as usize, 4096).expect("todo");
 
-        let slab_ptr = unsafe { alloc(layout) };
+        let slab_ptr = unsafe { alloc(layout) as *mut BPNode };
 
         let slab = match NonNull::new(slab_ptr) {
             Some(p) => p,
@@ -42,17 +47,28 @@ impl BPTree {
         BPTree {
             slab,
             cap: inner_node_upper_bound,
-            root: AtomicU64::new(1 << 32),
+            root: 1 << 48,
+            root_vlock: AtomicU64::new(0),
             next_free: AtomicU32::new(1),
             free_list: AtomicU32::new(u32::MAX),
         }
     }
 
-    pub fn get_root(&self) -> BPRootInfo {
-        let info = self.root.load(Ordering::Acquire);
-        // let node = BPNodeId(info as u32);
+    pub fn read_root(&self) -> Result<RootReadLock, BPRestart> {
+        let version = self.root_vlock.load(Ordering::Acquire);
+        if is_locked_or_obsolete(version) {
+            return Err(BPRestart);
+        }
+        Ok(RootReadLock {
+            tree: self,
+            version,
+        })
+    }
+
+    /// Must have checked the root lock
+    pub unsafe fn get_root(&self) -> BPRootInfo {
+        let info = self.root;
         let level = (info >> 48) as u16;
-        // BPRootInfo { level, node }
 
         const PAGE_MASK: u64 = (1 << 48) - 1;
         match NonZeroU16::new(level) {
@@ -64,50 +80,225 @@ impl BPTree {
         }
     }
 
-    pub fn read_inner(&self, node: BPNodeId) -> InnerReadGuard {
-        todo!()
-    }
-    pub fn write_inner(&self, node: BPNodeId) -> InnerWriteGuard {
-        todo!()
-    }
+    pub fn read_inner(&self, node: BPNodeId) -> Result<InnerReadGuard, BPRestart> {
+        let node = unsafe { self.slab.add(node.0 as usize).as_ref() };
 
-    pub fn read_traverse_leaf(&self, key: &[u8]) -> PageId {
-        'restart: for _ in 0..SPIN_RETRIES {
-            let (level, node) = match self.get_root() {
-                BPRootInfo::Leaf(page_id) => return page_id,
-                BPRootInfo::Inner { level, node } => (level.get(), node),
-            };
+        let version = node.vlock.load(Ordering::Acquire);
 
-            let mut parent_level = level;
-            let mut parent_guard = self.read_inner(node);
-
-            while parent_level > 1 {
-                // // SAFETY: level of parent > 1
-                let cur_node = unsafe { parent_guard.as_ref().search_for_inner(key) };
-                let cur_guard = self.read_inner(cur_node);
-
-                if let Err(BPRestart) = parent_guard.unlock_or_restart() {
-                    continue 'restart;
-                }
-
-                parent_guard = cur_guard;
-                parent_level -= 1;
-            }
-            debug_assert!(parent_level == 1);
-
-            let leaf_cand = unsafe { parent_guard.as_ref().search_for_leaf(key) };
-
-            if let Err(BPRestart) = parent_guard.unlock_or_restart() {
-                continue 'restart;
-            }
-            return leaf_cand;
+        match is_locked_or_obsolete(version) {
+            true => Err(BPRestart),
+            false => Ok(InnerReadGuard {
+                version,
+                node: node.into(),
+                _marker: PhantomData,
+            }),
         }
-        todo!()
+    }
+    pub fn write_inner(&self, node: BPNodeId) -> Result<InnerWriteGuard, BPRestart> {
+        let read = self.read_inner(node)?;
+        read.upgrade()
+    }
+
+    pub fn read_traverse_leaf(&self, key: &[u8]) -> Result<ReadRes, QSError> {
+        for _ in 0..SPIN_RETRIES {
+            if let Ok(leaf) = self.try_read_traverse_leaf(key) {
+                return Ok(leaf);
+            }
+        }
+        Err(QSError::OLCRetriesExceeded)
+    }
+
+    fn try_read_traverse_leaf(&self, key: &[u8]) -> Result<ReadRes, BPRestart> {
+        let root_guard = self.read_root()?;
+
+        let mut underflow_point = WriteLockPoint::Root;
+        let mut overflow_point = WriteLockPoint::Root;
+
+        // SAFETY: we checked its not locked or obsolete
+        let (level, node) = match unsafe { self.get_root() } {
+            BPRootInfo::Leaf(page) => {
+                return Ok(ReadRes {
+                    page,
+                    overflow_point,
+                    underflow_point,
+                })
+            }
+            BPRootInfo::Inner { level, node } => (level.get(), node),
+        };
+
+        let mut parent_level = level;
+        let Ok(mut parent_guard) = self.read_inner(node) else {
+            return Err(BPRestart);
+        };
+
+        root_guard.unlock_or_restart()?;
+
+        update_lock_points(
+            &parent_guard,
+            parent_level,
+            &mut overflow_point,
+            &mut underflow_point,
+        );
+
+        while parent_level > 1 {
+            // // SAFETY: level of parent > 1
+            let cur_node = unsafe { parent_guard.as_ref().search_for_inner(key) };
+            let cur_guard = self.read_inner(cur_node)?;
+
+            parent_guard.unlock_or_restart()?;
+
+            parent_guard = cur_guard;
+            parent_level -= 1;
+
+            update_lock_points(
+                &parent_guard,
+                parent_level,
+                &mut overflow_point,
+                &mut underflow_point,
+            );
+        }
+        debug_assert!(parent_level == 1);
+
+        let leaf_cand = unsafe { parent_guard.as_ref().search_for_leaf(key) };
+
+        parent_guard.unlock_or_restart()?;
+        return Ok(ReadRes {
+            page: leaf_cand,
+            overflow_point,
+            underflow_point,
+        });
+    }
+
+    pub fn lock_from_point<'a>(
+        &'a self,
+        point: WriteLockPoint<'a>,
+        key: &[u8],
+    ) -> Result<(Option<RootWriteLock<'a>>, Vec<InnerWriteGuard<'a>>), BPRestart> {
+        let mut root_lock: Option<RootWriteLock> = None;
+        let mut acc = Vec::new();
+        let (mut guard, mut level) = match point {
+            WriteLockPoint::Root => {
+                let read_guard = self.read_root()?;
+                let write_guard = read_guard.upgrade()?;
+                match unsafe { self.get_root() } {
+                    BPRootInfo::Leaf(page_id) => return Ok((Some(write_guard), vec![])),
+                    BPRootInfo::Inner { level, node } => {
+                        root_lock = Some(write_guard);
+                        let g = self.write_inner(node)?;
+                        (g, level.get())
+                    }
+                }
+            }
+            WriteLockPoint::Inner { guard, level } => {
+                let first = guard.upgrade()?;
+                (first, level)
+            }
+        };
+
+        while level > 1 {
+            let next = unsafe { guard.as_ref().search_for_inner(key) };
+            let next_guard = self.write_inner(next)?;
+            // don't need to check because we have exclusive access to parent
+            acc.push(guard);
+            guard = next_guard;
+        }
+
+        Ok((root_lock, acc))
+    }
+}
+
+pub struct RootReadLock<'a> {
+    tree: &'a BPTree,
+    version: u64,
+}
+
+impl<'a> RootReadLock<'a> {
+    pub fn get_root(&self) -> BPRootInfo {
+        unsafe { self.tree.get_root() }
+    }
+
+    pub fn upgrade(&self) -> Result<RootWriteLock<'a>, BPRestart> {
+        let new_version = self.version + 0b10;
+        match self.tree.root_vlock.compare_exchange_weak(
+            self.version,
+            new_version,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(RootWriteLock { tree: self.tree }),
+            Err(_v) => Err(BPRestart),
+        }
+    }
+
+    pub fn unlock_or_restart(self) -> Result<(), BPRestart> {
+        self.check_or_restart()
+    }
+
+    pub fn check_or_restart(&self) -> Result<(), BPRestart> {
+        let nv = self.tree.root_vlock.load(Ordering::Acquire);
+
+        match self.version == nv {
+            true => Ok(()),
+            false => Err(BPRestart),
+        }
+    }
+}
+
+pub struct RootWriteLock<'a> {
+    tree: &'a BPTree,
+}
+
+impl<'a> RootWriteLock<'a> {
+    pub fn get_root(&self) -> BPRootInfo {
+        unsafe { self.tree.get_root() }
+    }
+}
+
+impl<'a> Drop for RootWriteLock<'a> {
+    fn drop(&mut self) {
+        self.tree.root_vlock.fetch_add(0b10, Ordering::Release);
+    }
+}
+
+fn update_lock_points<'a>(
+    guard: &InnerReadGuard<'a>,
+    level: u16,
+    overflow: &mut WriteLockPoint<'a>,
+    underflow: &mut WriteLockPoint<'a>,
+) {
+    // If node can't split update overflow
+    if !guard.as_ref().can_overflow(level) {
+        *overflow = WriteLockPoint::Inner {
+            guard: guard.clone(),
+            level,
+        }
+    }
+    // If node can't underflow update that
+    if !guard.as_ref().will_underflow() {
+        *underflow = WriteLockPoint::Inner {
+            guard: guard.clone(),
+            level,
+        }
     }
 }
 
 #[repr(transparent)]
 pub struct BPNodeId(u32);
+
+pub struct ReadRes<'a> {
+    pub page: PageId,
+    pub overflow_point: WriteLockPoint<'a>,
+    pub underflow_point: WriteLockPoint<'a>,
+}
+
+pub enum WriteLockPoint<'a> {
+    /// The operation requires locking from the root pointer
+    Root,
+    Inner {
+        guard: InnerReadGuard<'a>,
+        level: u16,
+    },
+}
 
 pub enum BPRootInfo {
     Leaf(PageId),
@@ -118,6 +309,7 @@ pub enum BPRootInfo {
     },
 }
 
+#[derive(Clone)]
 pub struct InnerReadGuard<'a> {
     version: u64,
     node: NonNull<BPNode>,
@@ -127,9 +319,10 @@ pub struct InnerReadGuard<'a> {
 impl<'a> InnerReadGuard<'a> {
     pub fn as_ref(&self) -> &BPNode {
         unsafe { self.node.as_ref() }
+        // &self.node
     }
 
-    pub fn upgrade(&self) -> Result<InnerWriteGuard, BPRestart> {
+    pub fn upgrade(self) -> Result<InnerWriteGuard<'a>, BPRestart> {
         let new_version = self.version + 0b10;
         match self.as_ref().vlock.compare_exchange_weak(
             self.version,
@@ -138,7 +331,7 @@ impl<'a> InnerReadGuard<'a> {
             Ordering::Relaxed,
         ) {
             Ok(_) => Ok(InnerWriteGuard {
-                node: unsafe { &mut *(self.node.as_ptr()) },
+                node: unsafe { &mut *self.node.as_ptr() },
             }),
             Err(_v) => Err(BPRestart),
         }
@@ -183,9 +376,12 @@ impl<'a> Drop for InnerWriteGuard<'a> {
 ///                                             4072B
 // NOTE: this is inefficient use of memory, but I want to keep everything word aligned
 // so this is easier, but more information can easily be squeesed in, (at least 32 bit)
+#[repr(C)]
 pub struct BPNode {
     vlock: AtomicU64,
     count: u32,
+    /// index of the last allocated byte in the rest buffer
+    /// a la a stack pointer
     alloc_idx: u32,
     // all 1s for None
     lowest: u64,
@@ -203,24 +399,99 @@ impl BPNode {
         node_ptr.write(BPNode {
             vlock: AtomicU64::new(0),
             count: 0,
-            alloc_idx: 4095,
+            alloc_idx: INLINE_BUFFER_LEN as u32 - 1,
             lowest: u64::MAX,
             rest: [0; INLINE_BUFFER_LEN],
         });
     }
 
-    pub fn capacity(&self) -> usize {
-        todo!()
+    /// calculate how much space is left in the node
+    pub fn space_left(&self) -> usize {
+        let kv_meta_size = size_of::<BPKVMeta>() * self.count as usize;
+
+        self.alloc_idx as usize - kv_meta_size + 1
     }
 
-    // SAFETY: This method should only be called on nodes with height > 1
+    /// The node can overflow when a key is added to it
+    pub fn can_overflow(&self, level: u16) -> bool {
+        let child_size = match level {
+            // If we are pointing to leafs we need 48 bit (6B)
+            1 => 6,
+            // If pointing to inner nodes then 32bit (4B)
+            _ => 4,
+        };
+        // If we have more space than the metadata, child, and max key then we can't overflow
+        if self.space_left() >= size_of::<BPKVMeta>() + MAX_KEY_LENGTH + child_size {
+            false
+        } else {
+            true
+        }
+    }
+
+    /// The node will be underfull if a key is removed
+    pub fn will_underflow(&self) -> bool {
+        // This is just a heuristic, experimentation needed
+        self.space_left() <= INLINE_BUFFER_LEN / 2
+    }
+
+    /// SAFETY: This method should only be called on nodes with height > 1
     pub unsafe fn search_for_inner(&self, key: &[u8]) -> BPNodeId {
-        todo!()
+        let idx = self.binary_search(key);
+        let pivot_key = self.get_key(idx);
+        if key < pivot_key {
+            BPNodeId(self.lowest as u32)
+        } else {
+            let m = self.get_meta(idx);
+            let child_offset = m.start_offset as usize + m.key_len as usize;
+            let child_ptr = self.rest.as_ptr().add(child_offset);
+            let child = extract_u32(child_ptr);
+            BPNodeId(child)
+        }
     }
 
     // SAFETY: This method should only be called on nodes with height = 1
     pub unsafe fn search_for_leaf(&self, key: &[u8]) -> PageId {
-        todo!()
+        let idx = self.binary_search(key);
+        let pivot_key = self.get_key(idx);
+        if key < pivot_key {
+            PageId(self.lowest)
+        } else {
+            let m = self.get_meta(idx);
+            let child_offset = m.start_offset as usize + m.key_len as usize;
+            let child_ptr = self.rest.as_ptr().add(child_offset);
+            let child = extract_u48(child_ptr);
+            PageId(child)
+        }
+    }
+
+    // find the index of the largest key smaller than the target, and that key
+    #[inline]
+    fn binary_search(&self, key: &[u8]) -> u32 {
+        let mut low = 0;
+        let mut high = self.count;
+
+        while low < high {
+            let mid = low.midpoint(high);
+            let mid_key = self.get_key(mid);
+            if mid_key <= key {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        return low;
+    }
+
+    fn get_meta(&self, idx: u32) -> BPKVMeta {
+        let start_ptr = self.rest.as_ptr() as *const BPKVMeta;
+        unsafe { start_ptr.add(idx as usize).read() }
+    }
+
+    fn get_key(&self, idx: u32) -> &[u8] {
+        let meta = self.get_meta(idx);
+        let start = meta.start_offset as usize;
+        let end = start + meta.key_len as usize;
+        &self.rest[start..end]
     }
 }
 
@@ -286,22 +557,25 @@ impl BPNode {
 //         return version;
 //     }
 
-//     fn set_locked_bit(version: u64) -> u64 {
-//         version + 2
-//     }
+fn set_locked_bit(version: u64) -> u64 {
+    version + 2
+}
 
-//     fn is_obsolete(version: u64) -> bool {
-//         (version & 1) == 1
-//     }
+fn is_obsolete(version: u64) -> bool {
+    (version & 1) == 1
+}
 
-//     fn is_locked_or_obsolete(version: u64) -> bool {
-//         (version & 0b11) != 0
-//     }
+fn is_locked_or_obsolete(version: u64) -> bool {
+    (version & 0b11) != 0
+}
 // }
 
-// struct BPKVMeta {
-//     lookahead: u16,
-//     offset:
-// }
+// TODO: add lookahead bytes
+#[repr(C)]
+struct BPKVMeta {
+    /// offset from the start of the rest buffer, of the start of the key
+    start_offset: u16,
+    key_len: u16,
+}
 
 pub struct BPRestart;

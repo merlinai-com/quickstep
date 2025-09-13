@@ -1,5 +1,6 @@
 use std::{
     alloc::{alloc, Layout},
+    f64::consts::E,
     iter::Map,
     marker::PhantomData,
     ptr::NonNull,
@@ -104,6 +105,7 @@ impl MapTable {
         Err(QSError::PageLockFail)
     }
 
+    // TODO: refactor to take read lock and upgrade
     pub fn write_page_entry(&self, page: PageId) -> Result<PageWriteGuard, QSError> {
         let entry_ref = self.get_ref(page);
         let mut entry = PageEntry(entry_ref.load(Ordering::Acquire));
@@ -178,7 +180,7 @@ impl<'a> PageReadGuard<'a> {
 }
 
 impl<'a> PageReadGuard<'a> {
-    pub fn upgrade(self) -> PageWriteGuard<'a> {
+    pub fn upgrade(self) -> Result<PageWriteGuard<'a>, (PageReadGuard<'a>, QSError)> {
         let map_table = self.map_table;
         let page = self.page;
         let node = self.node.clone();
@@ -200,15 +202,16 @@ impl<'a> PageReadGuard<'a> {
                         Ordering::Relaxed,
                     ) {
                         Ok(_) => {
-                            return PageWriteGuard {
+                            return Ok(PageWriteGuard {
                                 map_table,
                                 page,
                                 node,
-                            }
+                            })
                         }
                         Err(e) => entry = PageEntry(e),
                     }
                 }
+                // TODO: set writer waiting bit
                 _ => {
                     std::hint::spin_loop();
                     entry = PageEntry(entry_ref.load(Ordering::Relaxed));
@@ -216,7 +219,15 @@ impl<'a> PageReadGuard<'a> {
             }
         }
 
-        todo!()
+        // TODO: try to unset writer waiting bit
+
+        let original_guard = PageReadGuard {
+            map_table,
+            page,
+            node,
+        };
+
+        Err((original_guard, QSError::PageLockFail))
     }
 }
 
@@ -251,6 +262,8 @@ impl<'a> PageWriteGuard<'a> {
     pub fn node<'g>(&'g self) -> NodeRef<'g> {
         self.node.get_ref()
     }
+
+    pub fn update_node<'g>(&'g mut self, node: NodeRef<'g>) {}
 }
 
 impl<'a> PageWriteGuard<'a> {

@@ -1,4 +1,9 @@
-use std::{mem::transmute, path::Prefix, ptr::slice_from_raw_parts, slice};
+use std::{
+    mem::transmute,
+    path::Prefix,
+    ptr::{copy, slice_from_raw_parts, slice_from_raw_parts_mut},
+    slice, usize,
+};
 
 use crate::types::{KVMeta, NodeMeta};
 
@@ -16,14 +21,66 @@ impl NodeMeta {
             false => None,
         }
     }
+
+    pub fn try_put(&mut self, key: &[u8], val: &[u8]) {
+        // TODO: copy old value for abort
+        match self.binary_search(self.get_node_prefix().len(), key) {
+            Ok(idx) => {
+                let target_kv = self.get_kv_meta(idx);
+                match target_kv.val_size() as usize == val.len() {
+                    true => {
+                        // Don't need to change layout, just rewrite
+                        let val_slice = self.get_val_mut_from_meta(target_kv);
+                        val_slice.copy_from_slice(val);
+                    }
+                    false => {
+                        // different length: shift other entries, then rewrite
+
+                        let alloc_ptr = unsafe { self.erase_kv_in_buffer(target_kv) };
+
+                        let new_size = key.len() + val.len();
+                        let new_offset = alloc_ptr - new_size;
+
+                        // Add 1 to account for Node meta
+                        let meta_end = (self.record_count() as usize + 1) * size_of::<KVMeta>();
+
+                        if new_offset < meta_end {
+                            todo!("return error for split or resize")
+                        }
+
+                        // TODO: sort out keys being written including removing prefix
+
+                        let target_kv = self.get_kv_meta_mut(idx);
+                        target_kv.set_offset(new_offset as u16);
+                        target_kv.set_val_size(val.len() as u16);
+
+                        self.get_val_mut_from_meta(*target_kv).copy_from_slice(val);
+                    }
+                }
+            }
+            Err(idx) => {
+                // check there's enough space, then move the kvmetas then add value
+            }
+        }
+    }
 }
 
 impl NodeMeta {
     #[inline]
     pub fn get_kv_meta(&self, kv_index: usize) -> KVMeta {
-        let kv_meta_start = unsafe { transmute::<_, *const KVMeta>(self).offset(1) };
+        // let kv_meta_start = unsafe { transmute::<_, *const KVMeta>(self).offset(1) };
+        const _: () = assert!(size_of::<KVMeta>() == size_of::<NodeMeta>());
+        let kv_meta_start = unsafe { (self as *const NodeMeta as *const KVMeta).add(1) };
         debug_assert!(kv_index < self.record_count() as usize);
-        unsafe { kv_meta_start.offset(kv_index as isize).read() }
+        unsafe { kv_meta_start.add(kv_index).read() }
+    }
+
+    #[inline]
+    pub fn get_kv_meta_mut(&self, kv_index: usize) -> &mut KVMeta {
+        let kv_meta_start =
+            unsafe { (self as *const NodeMeta as *const KVMeta as *mut KVMeta).add(1) };
+        debug_assert!(kv_index < self.record_count() as usize);
+        unsafe { &mut *kv_meta_start.add(kv_index) }
     }
 
     pub fn get_node_prefix(&self) -> &[u8] {
@@ -46,10 +103,7 @@ impl NodeMeta {
     #[inline]
     ///Find the location a key would be in the
     pub fn binary_search(&self, prefix_len: usize, key: &[u8]) -> Result<usize, usize> {
-        let target_lookahead = &key[prefix_len];
-
-        // TODO: check how this interacts with endianness
-        let target_lookahead = unsafe { transmute::<_, &u16>(target_lookahead) };
+        let target_lookahead = get_lookahead(key, prefix_len);
 
         let mut lower = 1usize;
         let mut upper = self.record_count() as usize - 1;
@@ -84,6 +138,47 @@ impl NodeMeta {
         Err(lower)
     }
 
+    /// Erase the key value data in a buffer, while keeping the kvmeta
+    /// Returns the new min offset
+    unsafe fn erase_kv_in_buffer(&mut self, kv: KVMeta) -> usize {
+        let base_ptr = self.get_base_ptr() as *mut u8;
+        let len = (kv.key_size() + kv.val_size()) as usize;
+        let target_offset = kv.offset();
+        let mut min_offset = target_offset;
+
+        for i in 0..self.record_count() as usize {
+            let kv = self.get_kv_meta_mut(i);
+            let cur_offset = kv.offset();
+
+            if cur_offset < target_offset {
+                min_offset = min_offset.min(cur_offset);
+                let new_offset = cur_offset + len;
+                kv.set_offset(new_offset as u16);
+            }
+        }
+
+        if min_offset == target_offset {
+            return target_offset + len;
+        }
+
+        let src_ptr = base_ptr.add(min_offset);
+
+        let dst_ptr = base_ptr.add(min_offset + len);
+
+        copy(src_ptr, dst_ptr, len);
+
+        min_offset + len
+    }
+
+    fn find_min_offset(&self) -> usize {
+        // let mut min = self.get_kv_meta(0).offset();
+        // for 1..self.record_count() {}
+        (0..self.record_count())
+            .map(|i| self.get_kv_meta(i as usize).offset())
+            .min()
+            .expect("There should always be at least 2 fence keys") as usize
+    }
+
     #[inline]
     pub fn get_key_from_meta(&self, kv: KVMeta) -> &[u8] {
         let base_ptr = self.get_base_ptr();
@@ -106,7 +201,25 @@ impl NodeMeta {
     }
 
     #[inline]
+    pub fn get_val_mut_from_meta(&mut self, kv: KVMeta) -> &mut [u8] {
+        let base_ptr = self.get_base_ptr() as *mut u8;
+
+        let offset = kv.offset() as isize;
+        let key_len = kv.key_size() as isize;
+        let val_len = kv.val_size() as usize;
+
+        unsafe { slice::from_raw_parts_mut(base_ptr.offset(offset + key_len), val_len) }
+    }
+
+    #[inline]
     fn get_base_ptr(&self) -> *const u8 {
         self as *const NodeMeta as *const u8
     }
+}
+
+#[inline]
+fn get_lookahead(key: &[u8], prefix_len: usize) -> u16 {
+    let b0 = unsafe { *key.get_unchecked(prefix_len) };
+    let b1 = key.get(prefix_len + 1).copied().unwrap_or_default();
+    u16::from_be_bytes([b0, b1])
 }
