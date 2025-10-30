@@ -1,4 +1,4 @@
-use std::{collections::HashMap, mem, ptr::read};
+use std::{collections::HashMap, mem};
 
 use crate::{
     error::QSError,
@@ -18,6 +18,24 @@ impl<'a> LockManager<'a> {
         LockManager {
             locks: HashMap::new(),
         }
+    }
+
+    pub fn insert_write_lock<'tx>(
+        &'tx mut self,
+        guard: PageWriteGuard<'a>,
+    ) -> WriteGuardWrapper<'tx, 'a> {
+        let id = guard.page.0;
+        let wrapped = PageGuard {
+            guard_inner: GuardWrapper::Write(guard),
+            leaf: None,
+        };
+        self.locks.insert(id, wrapped);
+        let tmp = self
+            .locks
+            .get_mut(&id)
+            .expect("We just inserted this value");
+
+        WriteGuardWrapper(tmp)
     }
 
     pub fn get_or_acquire_read_lock(
@@ -48,7 +66,7 @@ impl<'a> LockManager<'a> {
         &'tx mut self,
         mapping_table: &'a MapTable,
         page: PageId,
-    ) -> Result<WritePageGuard<'tx, 'a>, QSError> {
+    ) -> Result<WriteGuardWrapper<'tx, 'a>, QSError> {
         if !self.locks.contains_key(&page.0) {
             let guard = mapping_table.write_page_entry(page)?;
 
@@ -76,7 +94,23 @@ pub enum GuardWrapper<'a> {
 }
 
 /// Inner page guard is guarenteed to be a write
-pub struct WritePageGuard<'tx, 'a>(pub &'tx mut PageGuard<'a>);
+pub struct WriteGuardWrapper<'tx, 'a>(&'tx mut PageGuard<'a>);
+
+impl<'tx, 'a> WriteGuardWrapper<'tx, 'a> {
+    pub unsafe fn new(guard: &'tx mut PageGuard<'a>) -> WriteGuardWrapper<'tx, 'a> {
+        WriteGuardWrapper(guard)
+    }
+
+    pub fn get_write_guard<'b>(&'b mut self) -> &'b mut PageWriteGuard<'a> {
+        let out = match self.0.guard_inner {
+            GuardWrapper::Write(ref mut g) => g,
+            GuardWrapper::Read(_) => {
+                unreachable!("WritePageGuard guarentees that we hold a write guard")
+            }
+        };
+        out
+    }
+}
 
 pub struct PageGuard<'a> {
     pub guard_inner: GuardWrapper<'a>,
@@ -90,9 +124,9 @@ impl<'a> PageGuard<'a> {
 
     /// Upgrade to a write transaction, if not already
     /// If it fails it will
-    pub fn ensure_write<'tx>(&'tx mut self) -> Result<WritePageGuard<'tx, 'a>, QSError> {
+    pub fn ensure_write<'tx>(&'tx mut self) -> Result<WriteGuardWrapper<'tx, 'a>, QSError> {
         let write = match &mut self.guard_inner {
-            GuardWrapper::Write(_) => return Ok(WritePageGuard(self)),
+            GuardWrapper::Write(_) => return Ok(WriteGuardWrapper(self)),
             GuardWrapper::Read(g) => {
                 let ptr = g as *mut PageReadGuard<'a>;
                 // SAFTEY: we have a mutable reference, and aren't going to touch the old value
@@ -109,21 +143,21 @@ impl<'a> PageGuard<'a> {
             }
         };
         self.guard_inner = GuardWrapper::Write(write);
-        Ok(WritePageGuard(self))
+        Ok(WriteGuardWrapper(self))
     }
-
+}
+impl<'a> GuardWrapper<'a> {
     // TODO: do this in a more elegant way
     /// Temporarily upgrade to write lock
     /// when this is dropped it will revert the guard to its original state
     pub fn temp_upgrade<'tx>(&'tx mut self) -> Result<TmpPageWrite<'tx, 'a>, QSError> {
-        if let GuardWrapper::Write(ref mut w) = self.guard_inner {
+        if let GuardWrapper::Write(ref mut w) = self {
             return Ok(TmpPageWrite::WriteOriginal(w));
         }
 
-        let wrapper_ref = &mut self.guard_inner;
-        let wrapper_ptr = wrapper_ref as *mut GuardWrapper<'a>;
+        let wrapper_ptr = self as *mut GuardWrapper<'a>;
 
-        let GuardWrapper::Read(read_ref) = wrapper_ref else {
+        let GuardWrapper::Read(read_ref) = self else {
             unreachable!("We just checked for the write case")
         };
 
@@ -132,7 +166,7 @@ impl<'a> PageGuard<'a> {
             Ok(w) => {
                 unsafe { wrapper_ptr.write(GuardWrapper::Write(w)) };
 
-                let GuardWrapper::Write(guard) = wrapper_ref else {
+                let GuardWrapper::Write(guard) = self else {
                     unreachable!("We just wrote as a Write")
                 };
 

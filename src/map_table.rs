@@ -164,6 +164,7 @@ impl MapTable {
     }
 }
 
+/// An id of a leaf page, representing an index into the mapping table
 #[derive(Clone, Copy)]
 pub struct PageId(pub(crate) u64);
 
@@ -263,7 +264,7 @@ impl<'a> PageWriteGuard<'a> {
         self.node.get_ref()
     }
 
-    pub fn update_node<'g>(&'g mut self, node: NodeRef<'g>) {}
+    // pub fn node_mut<'g>(&'g mut self)
 }
 
 impl<'a> PageWriteGuard<'a> {
@@ -332,7 +333,7 @@ const _: () = assert!(WRITE_LOCK_STATE.count_ones() == 14);
 impl PageEntry {
     fn new_write_locked<'g>(node: MiniPageIndex<'g>) -> PageEntry {
         let repr = node.index << 16;
-        PageEntry(repr).set_state(WRITE_LOCK_STATE)
+        PageEntry(repr as u64).set_state(WRITE_LOCK_STATE)
     }
 
     fn to_repr(self) -> u64 {
@@ -352,7 +353,7 @@ impl PageEntry {
         match is_leaf {
             true => NodeRef::Leaf(addr),
             false => NodeRef::MiniPage(MiniPageIndex {
-                index: addr,
+                index: addr as usize,
                 _marker: std::marker::PhantomData,
             }),
         }

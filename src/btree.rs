@@ -1,6 +1,5 @@
 use std::{
     alloc::{alloc, Layout},
-    hint::spin_loop,
     marker::PhantomData,
     num::NonZeroU16,
     ptr::NonNull,
@@ -20,12 +19,20 @@ const MAX_KEY_LENGTH: usize = 64;
 
 // TODO: prevent race condition when freeing nodes
 pub struct BPTree {
+    /// The buffer containing all nodes, allocated at initialisation
     slab: NonNull<BPNode>,
+    /// The number of nodes we have capacity for in the above buffer
     cap: u32,
+    /// The root node and level of the root
+    /// If the level is 0 then its a 48bit pageid
+    /// otherwise its a 32bit BP Tree index
     /// level | node id
     root: u64,
+    /// The version lock for the pointer to the root node
     root_vlock: AtomicU64,
+    /// index of next free node in the buffer
     next_free: AtomicU32,
+    /// start of node free list, u32::MAX if empty
     free_list: AtomicU32,
 }
 
@@ -121,6 +128,8 @@ impl BPTree {
                     page,
                     overflow_point,
                     underflow_point,
+                    upper_fence_key: None,
+                    lower_fence_key: None,
                 })
             }
             BPRootInfo::Inner { level, node } => (level.get(), node),
@@ -166,7 +175,38 @@ impl BPTree {
             page: leaf_cand,
             overflow_point,
             underflow_point,
+            lower_fence_key: todo!(),
+            upper_fence_key: todo!(),
         });
+    }
+
+    pub fn write_lock<'a>(
+        &'a self,
+        point: WriteLockPoint<'a>,
+        op_type: OpType,
+        key: &[u8],
+    ) -> Result<(Option<RootWriteLock<'a>>, Vec<InnerWriteGuard<'a>>), QSError> {
+        // try to lock from the existing point
+        if let Ok(l) = self.lock_from_point(point, key) {
+            return Ok(l);
+        }
+
+        for _ in 0..SPIN_RETRIES {
+            let Ok(res) = self.try_read_traverse_leaf(key) else {
+                continue;
+            };
+
+            let lock_point = match op_type {
+                OpType::Split => res.overflow_point,
+                OpType::Merge => res.underflow_point,
+            };
+
+            if let Ok(res) = self.lock_from_point(lock_point, key) {
+                return Ok(res);
+            };
+        }
+
+        Err(QSError::OLCRetriesExceeded)
     }
 
     pub fn lock_from_point<'a>(
@@ -205,6 +245,11 @@ impl BPTree {
 
         Ok((root_lock, acc))
     }
+}
+
+pub enum OpType {
+    Split,
+    Merge,
 }
 
 pub struct RootReadLock<'a> {
@@ -286,9 +331,16 @@ fn update_lock_points<'a>(
 pub struct BPNodeId(u32);
 
 pub struct ReadRes<'a> {
+    /// Page where the target would be located
     pub page: PageId,
+    /// Page to write lock from if a split is needed
     pub overflow_point: WriteLockPoint<'a>,
+    /// Page to write lock from if a merge is needed
     pub underflow_point: WriteLockPoint<'a>,
+    /// Lower fence key: a key that is less than or equal everything in the target page
+    pub lower_fence_key: Option<(Box<[u8]>, PageId)>,
+    /// Upper fence key: a key that is strictly greater than everything in target page
+    pub upper_fence_key: Option<(Box<[u8]>, PageId)>,
 }
 
 pub enum WriteLockPoint<'a> {

@@ -1,13 +1,16 @@
 use std::{
     marker::PhantomData,
-    mem::transmute,
+    ptr::NonNull,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    usize,
 };
 
 use crate::{
     buffer,
+    io_engine::{self, DiskLeaf, IoEngine},
+    map_table::MapTable,
     types::{NodeMeta, NodeSize},
-    SPIN_RETRIES,
+    QuickStepTx, SPIN_RETRIES,
 };
 
 ///         head     2nd chance        tail
@@ -16,13 +19,21 @@ use crate::{
 ///    |     [  ][][  ][    ][][  ][][][]                   |
 ///    +----------------------------------------------------+
 pub struct MiniPageBuffer {
-    buffer: Box<[u64]>,
+    buffer: NonNull<u64>,
+    /// number of words in buffer, must be a power of 2
+    buff_size: usize,
     /// u64::MAX represents None
     free_lists: [AtomicUsize; 7],
     /// start of the oldest node not yet fully freed
     head: AtomicUsize,
     /// start of unmanaged memory
     tail: AtomicUsize,
+}
+
+impl MiniPageBuffer {
+    const fn wrap(&self, index: usize) -> usize {
+        index & (self.buff_size - 1)
+    }
 }
 
 impl MiniPageBuffer {
@@ -39,7 +50,7 @@ impl MiniPageBuffer {
             match head < tail {
                 // barrier is end of buffer
                 true => {
-                    let free_space_words = self.buffer.len() - tail;
+                    let free_space_words = self.buff_size - tail;
 
                     match free_space_words >= req_size {
                         true => {
@@ -100,7 +111,9 @@ impl MiniPageBuffer {
             }
 
             // next pointer should be stored in the word after the meta
-            let next = self.buffer[head_index + 1];
+            // let next = self.buffer[head_index + 1];
+            let next = unsafe { &*(self.buffer.add(head_index + 1).as_ptr() as *const AtomicU64) }
+                .load(Ordering::Relaxed);
 
             match free_list_head.compare_exchange_weak(
                 head_index,
@@ -116,7 +129,72 @@ impl MiniPageBuffer {
         None
     }
 
-    pub fn evict(&self) {}
+    pub fn evict(&self, map_table: &MapTable, io_engine: &IoEngine) {
+        // scan through items in the last chance zone
+        // for each:
+        // de mark ref bit,
+
+        // TODO: deal with race condition where I read the head pointer, but someone else advances the head pointer and allocates a different node
+        let mut eviction_cand = self.head.load(Ordering::Relaxed);
+
+        let (guard, node) = loop {
+            // Need to be careful with the operations we do on this
+            let cand_meta = unsafe { &*self.get_meta_ptr(eviction_cand) };
+
+            match cand_meta.is_being_evicted() {
+                true => {}
+                false => {
+                    match cand_meta.mark_for_eviction() {
+                        Ok(_) => match map_table.write_page_entry(cand_meta.page_id()) {
+                            Ok(g) => {
+                                // TODO: add assertion that we've got the right lock
+                                break (g, cand_meta);
+                            }
+                            Err(_) => {
+                                todo!("Should we skip to the next one?")
+                            }
+                        },
+                        Err(_) => {}
+                    };
+                }
+            }
+            let offset = cand_meta.size().size_in_bytes();
+            eviction_cand = self.wrap(eviction_cand + offset);
+        };
+
+        // Check if its in free list, if so remove from free list
+
+        // let mut disk_leaf: Option<DiskLeaf> = None;
+        // let leaf_addr = node.leaf();
+
+        // let cnt = node.record_count() as usize;
+        // for i in 0..cnt {
+        //     let kv = node.get_kv_meta(i);
+
+        //     if kv.fence() {
+        //         continue;
+        //     }
+
+        //     if kv.typ().is_dirty() {
+        //         match disk_leaf.as_mut() {
+        //             Some(leaf) => {
+        //                 todo!("merge logic")
+        //             }
+        //             leaf_ref => {
+        //                 let leaf = io_engine.get_page(leaf_addr);
+        //                 leaf_ref = Some(())
+        //                 todo!("merge logic")
+        //             }
+        //         }
+        //     }
+        // }
+
+        // if let Some(dirty_leaf) = disk_leaf {
+        //     io_engine.write_page(leaf_addr, dirty_leaf);
+        // }
+
+        // guard.
+    }
 
     /// Deallocate a mini-page, this mini-page must be unused, ie. not appear in the mapping table
     pub unsafe fn dealloc(&self, node: MiniPageIndex) {
@@ -130,20 +208,20 @@ impl MiniPageBuffer {
         let size = node_meta.size();
     }
 
-    /// SAFETY: caller must guarentee that a mutable reference does not exist
+    pub unsafe fn get_meta_ptr(&self, index: usize) -> *mut NodeMeta {
+        unsafe { self.buffer.add(index).as_ptr() as *mut NodeMeta }
+    }
+
+    /// SAFETY: caller must guarentee that a mutable reference does not exist eg. hold a lock
     pub unsafe fn get_meta_ref<'g>(&self, node: MiniPageIndex<'g>) -> &'g NodeMeta {
         // SAFETY: MiniPageIndex was created as an index to the metadata of a valid NodeMeta
-        unsafe {
-            &*(self.buffer.get_unchecked(node.index as usize) as *const u64 as *const NodeMeta)
-        }
+        unsafe { &*self.get_meta_ptr(node.index) }
     }
 
     /// SAFETY: caller must guarentee that no other references exist
     pub unsafe fn get_meta_mut<'g>(&self, node: MiniPageIndex<'g>) -> &'g mut NodeMeta {
         // SAFETY: MiniPageIndex was created as an index to the metadata of a valid NodeMeta
-        unsafe {
-            &mut *(self.buffer.as_ptr().add(node.index as usize) as *mut u64 as *mut NodeMeta)
-        }
+        unsafe { &mut *self.get_meta_ptr(node.index) }
     }
 }
 
@@ -151,6 +229,18 @@ impl MiniPageBuffer {
 // pub(crate) struct MiniPageIndex(pub(crate) u64);
 pub struct MiniPageIndex<'g> {
     //only 48 bits used
-    pub(crate) index: u64,
+    pub(crate) index: usize,
     pub(crate) _marker: PhantomData<&'g ()>,
+}
+
+impl<'g> MiniPageIndex<'g> {
+    /// # SAFETY
+    /// index must be valid allocated index into the minipage buffer
+    /// the metadata must be initialised and valid
+    pub unsafe fn new(index: usize) -> MiniPageIndex<'g> {
+        MiniPageIndex {
+            index,
+            _marker: PhantomData,
+        }
+    }
 }

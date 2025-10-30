@@ -1,21 +1,49 @@
-use std::mem::transmute;
+use std::{error::Error, mem::transmute};
 
-use crate::buffer::MiniPageIndex;
+use crate::{
+    buffer::{MiniPageBuffer, MiniPageIndex},
+    lock_manager::{self, LockManager, WriteGuardWrapper},
+    map_table::{PageId, PageWriteGuard},
+    QuickStepTx,
+};
 
 /// | key size | val size | offset | type | fence | ref | look ahead |
 ///      14b       14b       16b       2b     1b     1b       16b
 /// Note: only 12b is needed for the offset, as the maximum page size is 4096 = 2 ^ 12
 #[derive(Clone, Copy)]
 #[repr(transparent)]
-pub struct KVMeta(u64);
+pub struct KVMeta(pub u64);
 
 impl KVMeta {
+    /// Arguments must fit within the bits of the repr or will be truncated or corrupt the result
+    pub fn new(
+        key_size: usize,
+        val_size: usize,
+        offset: usize,
+        typ: KVRecordType,
+        is_fence: bool,
+        refb: bool,
+        lookahead: u16,
+    ) -> KVMeta {
+        let mut acc = 0;
+        acc |= (key_size as u64) << 50;
+        acc |= (val_size as u64) << 36;
+        acc |= (offset as u64) << 36;
+        acc |= (typ as u64) << 18;
+        acc |= (is_fence as u64) << 17;
+        acc |= (refb as u64) << 16;
+        acc |= lookahead as u64;
+
+        KVMeta(acc)
+    }
+
     #[inline]
     pub fn key_size(&self) -> u64 {
         self.0 >> 50
     }
 
     #[inline]
+    #[must_use]
     pub fn set_key_size(&mut self, key_size: u16) {
         todo!()
     }
@@ -26,6 +54,7 @@ impl KVMeta {
     }
 
     #[inline]
+    #[must_use]
     pub fn set_val_size(&mut self, val_size: u16) {
         todo!()
     }
@@ -36,6 +65,7 @@ impl KVMeta {
     }
 
     #[inline]
+    #[must_use]
     pub fn set_offset(&mut self, offset: u16) {
         const OFFSET_MAST: u64 = { (u16::MAX as u64) << 20 };
 
@@ -59,6 +89,15 @@ impl KVMeta {
     pub fn ref_bit(&self) -> bool {
         const MASK: u64 = 1 << 16;
         (MASK & self.0) == MASK
+    }
+
+    #[inline]
+    #[must_use]
+    pub fn set_ref_bit(mut self, val: bool) -> KVMeta {
+        const MASK: u64 = 1 << 16;
+        self.0 &= !MASK;
+        self.0 |= (val as u64) << 16;
+        self
     }
 
     /// get 2 lookahead bytes of the key, after the common page prefix
@@ -115,17 +154,27 @@ pub enum NodeSize {
     N512 = 3,
     N1K = 4,
     N2K = 5,
-    N4K = 6,
-    LeafPage = 7,
+    LeafPage = 6,
 }
 
 impl NodeSize {
     pub const fn index(&self) -> usize {
-        match self {
-            // Leaf page is the same size as a 4k node, and should use the same free list
-            NodeSize::LeafPage => NodeSize::N4K.index(),
-            s => *s as usize,
-        }
+        *self as usize
+    }
+
+    pub fn from_byte_num(bytes: usize) -> Option<NodeSize> {
+        let cand = bytes.next_power_of_two() / 64;
+
+        Some(match cand {
+            0 => NodeSize::N64,
+            1 => NodeSize::N128,
+            2 => NodeSize::N256,
+            3 => NodeSize::N512,
+            4 => NodeSize::N1K,
+            5 => NodeSize::N2K,
+            6 => NodeSize::LeafPage,
+            _ => return None,
+        })
     }
 
     pub const fn size_in_words(&self) -> usize {
@@ -142,12 +191,16 @@ impl NodeSize {
 // TODO: if there are bits spare, seperate size from mini-node/ leaf
 /// Metadata of a leaf or mini-page
 /// INVARIANT: a reference to this must be part of a valid mini-page or leaf
-/// | Leaf | size | padding | live | split | record count
-///   48b  |  3b  |   2b    | 1b   |   1b  |      9b
+/// | Leaf | size | evicting | free-listed | live | split | record count
+///   48b  |  3b  |   1b     |      1b     | 1b   |   1b  |      9b
+///
+/// | NodeId | padding | free on disk
+///     48b  |    4b   |      12b
 /// Note: each record must take up at least 8 bytes, owing to the metadata, so there can only be 512/page
 ///     this means that 9b is sufficient to encode the record count
-#[repr(transparent)]
-pub struct NodeMeta(u64);
+#[repr(C)]
+// pub struct NodeMeta(AtomicU64, AtomicU64);
+pub struct NodeMeta(u64, u64);
 
 impl NodeMeta {
     // pub unsafe fn from_repr(repr: u64) -> NodeMeta {
@@ -157,14 +210,53 @@ impl NodeMeta {
     // pub fn to_repr(self) -> u64 {
     //     self.0
     // }
+
+    pub unsafe fn init<'tx, 'db>(
+        tx: &'tx mut QuickStepTx<'db>,
+        index: usize,
+        size: NodeSize,
+        disk_addr: Option<u64>,
+    ) -> WriteGuardWrapper<'tx, 'db> {
+        let node_ptr = tx.db.cache.get_meta_ptr(index);
+        let disk_addr = disk_addr.unwrap_or_else(|| tx.db.io_engine.get_new_addr());
+        let guard = tx.db.map_table.create_page_entry(MiniPageIndex::new(index));
+
+        let mut w0 = (disk_addr as u64) << 16;
+        w0 |= (size as u64) << 13;
+        // This node is live
+        w0 |= 1 << 10;
+
+        let mut w1 = guard.page.0 << 16;
+        let free = 4096 - size_of::<NodeMeta>();
+        w1 |= free as u64;
+
+        node_ptr.write(NodeMeta(w0, w1));
+
+        tx.lock_manager.insert_write_lock(guard)
+    }
 }
 
 impl NodeMeta {
+    #[inline]
+    pub fn leaf(&self) -> u64 {
+        self.0 >> 16
+    }
+
     #[inline]
     pub fn size(&self) -> NodeSize {
         let size_byte = ((self.0 >> 13) & 0b111) as u8;
         // SAFETY: this was just masked to 3 bits and all 3bit values are valid
         unsafe { transmute(size_byte) }
+    }
+
+    pub fn is_being_evicted(&self) -> bool {
+        todo!()
+    }
+
+    // TODO: this needs to basically do a version check, so we know that the head pointer hasn't been moved past it and it hasn't been messed with
+    // since we called, is being evicted
+    pub fn mark_for_eviction(&self) -> Result<(), ()> {
+        todo!()
     }
 
     #[inline]
@@ -173,8 +265,9 @@ impl NodeMeta {
         (self.0 & RECORD_COUNT_MASK) as u16
     }
 
-    pub fn leaf(&self) -> u64 {
-        self.0 >> 16
+    #[inline]
+    pub fn page_id(&self) -> PageId {
+        PageId(self.1 >> 16)
     }
 }
 

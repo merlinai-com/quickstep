@@ -1,7 +1,14 @@
-use crate::error::QSError;
-use crate::io_engine::{DiskLeaf, IoEngine};
-use crate::lock_manager::{GuardWrapper, PageGuard, WritePageGuard};
+use std::cell::UnsafeCell;
 
+use crate::error::QSError;
+use crate::io_engine::{self, DiskLeaf, IoEngine};
+use crate::lock_manager::{GuardWrapper, PageGuard, WriteGuardWrapper};
+
+use crate::map_table::PageWriteGuard;
+use crate::node::InsufficientSpace;
+use crate::rand::rand_for_cache;
+use crate::types::{NodeMeta, NodeSize};
+use crate::QuickStep;
 use crate::{buffer::MiniPageBuffer, types::NodeRef};
 
 impl<'a> PageGuard<'a> {
@@ -25,13 +32,14 @@ impl<'a> PageGuard<'a> {
                 // SAFETY: we have either a read or write lock
                 let node_meta = unsafe { cache.get_meta_ref(mini_page_index) };
                 let prefix = node_meta.get_node_prefix();
+                let key_suffix = &key[prefix.len()..];
                 match node_meta
-                    .binary_search(prefix.len(), key)
+                    .binary_search(key_suffix)
                     .map(|i| node_meta.get_kv_meta(i))
                 {
                     Ok(kv) => {
                         let val = match kv.typ().exists() {
-                            true => Some(node_meta.get_key_from_meta(kv)),
+                            true => Some(node_meta.get_val_from_meta(kv)),
                             false => None,
                         };
                         // Value is already cached, so early return
@@ -46,6 +54,10 @@ impl<'a> PageGuard<'a> {
                 leaf.as_ref().get(key)
             }
         };
+
+        // if rand_for_cache() {
+        //     if let Ok(tmp_write) = self.guard_inner.temp_upgrade() {}
+        // }
 
         // TODO: implement caching
         // if rand_for_cache() {
@@ -70,57 +82,120 @@ impl<'a> PageGuard<'a> {
     }
 }
 
-impl<'tx, 'a> WritePageGuard<'tx, 'a> {
+impl<'tx, 'a> WriteGuardWrapper<'tx, 'a> {
     pub fn try_put(
         &'tx mut self,
-        cache: &MiniPageBuffer,
-        io: &IoEngine,
+        db: &QuickStep,
         key: &[u8],
         val: &[u8],
-    ) -> Result<Option<&'tx [u8]>, QSError> {
-        let write_guard = match &mut self.0.guard_inner {
-            GuardWrapper::Write(g) => g,
-            GuardWrapper::Read(g) => {
-                unreachable!("WritePageGuard guarentees that we hold a write guard")
-            }
-        };
+    ) -> Result<(), SplitNeeded> {
+        // TODO: pass fence keys as args
+        let write_guard = self.get_write_guard();
 
         let node = write_guard.node();
 
-        let val = match node {
+        match node {
             NodeRef::Leaf(addr) => {
-                // let size =
+                // account for size of fence keys
+                let byte_size = size_of::<NodeMeta>() * 4 + key.len() + val.len();
+                let size =
+                    NodeSize::from_byte_num(byte_size).expect("TODO: handle oversize values");
 
-                // let leaf = ensure_page(io, &mut self.leaf, addr)?;
-                // leaf.as_ref().get(key)
+                let allocated = match db.cache.alloc(size) {
+                    Some(r) => r,
+                    None => {
+                        db.cache.evict(&db.map_table, &db.io_engine);
+                        db.cache
+                            .alloc(size)
+                            .expect("TODO: handle multiple evictions ")
+                    }
+                };
+
+                // TODO: initialise allocated mini-page
+
+                // let leaf = ensure_page(&db.io_engine, &mut self.leaf, addr).expect("todo");
+                // leaf.as_ref().get(key);
+                todo!()
             }
             NodeRef::MiniPage(mini_page_index) => {
                 // SAFETY: we have either a read or write lock
-                let node_meta = unsafe { cache.get_meta_ref(mini_page_index) };
-                let prefix = node_meta.get_node_prefix();
-                match node_meta
-                    .binary_search(prefix.len(), key)
-                    .map(|i| node_meta.get_kv_meta(i))
-                {
-                    Ok(kv) => {
-                        let val = match kv.typ().exists() {
-                            true => Some(node_meta.get_key_from_meta(kv)),
-                            false => None,
-                        };
-                        // Value is already cached, so early return
-                        return Ok(val);
-                    }
-                    Err(_) => {}
+                let node_meta = unsafe { db.cache.get_meta_mut(mini_page_index) };
+
+                match node_meta.try_put(key, val) {
+                    Ok(_) => Ok(()),
+                    Err(_) => todo!(),
                 }
 
-                let leaf_addr = node_meta.leaf();
-                let leaf = ensure_page(io, &mut self.leaf, leaf_addr)?;
+                // let prefix = node_meta.get_node_prefix();
+                // match node_meta
+                //     .binary_search(prefix.len(), key)
+                //     .map(|i| node_meta.get_kv_meta(i))
+                // {
+                //     Ok(kv) => {
 
-                leaf.as_ref().get(key)
+                //         // Value is already cached, so early return
+                //         return Ok(val);
+                //     }
+                //     Err(_) => {}
+                // }
+
+                // let leaf_addr = node_meta.leaf();
+                // let leaf = ensure_page(io, &mut self.leaf, leaf_addr)?;
+
+                // leaf.as_ref().get(key)
             }
+        }
+    }
+
+    pub fn merge_to_disk(&mut self, buffer: &MiniPageBuffer, io_engine: &IoEngine) {
+        let write_guard = self.get_write_guard();
+        let node = write_guard.node();
+        let index = match node {
+            NodeRef::Leaf(_) => {
+                panic!("should only be called on mini pages");
+            }
+            NodeRef::MiniPage(i) => i,
         };
 
-        Ok(val)
+        // SAFETY: we've got a write guard
+        // TODO: implement safe method on buffer with page write guard
+        let node = unsafe { buffer.get_meta_ref(index) };
+
+        let mut disk_leaf: Option<DiskLeaf> = None;
+        let leaf_addr = node.leaf();
+
+        let cnt = node.record_count() as usize;
+        // Check all entries to see if any need to be flushed to disk
+        for i in 0..cnt {
+            let kv = node.get_kv_meta(i);
+
+            if kv.fence() {
+                continue;
+            }
+
+            if kv.typ().is_dirty() {
+                if disk_leaf.is_none() {
+                    let leaf = io_engine.get_page(leaf_addr);
+                    disk_leaf = Some(leaf);
+                }
+
+                let key_suffix = node.get_stored_key_from_meta(kv);
+                let val = node.get_val_from_meta(kv);
+
+                disk_leaf
+                    .as_mut()
+                    .expect("just ensured was Some")
+                    .as_mut()
+                    .try_put_with_suffix(key_suffix, val)
+                    .expect(
+                        "We should have already split if there wouldn't be enough space on merge",
+                    );
+            }
+        }
+
+        if let Some(dirty_leaf) = disk_leaf {
+            io_engine.write_page(leaf_addr, &dirty_leaf);
+        }
     }
 }
 
@@ -139,3 +214,5 @@ fn ensure_page<'a>(
     };
     Ok(leaf)
 }
+
+pub struct SplitNeeded(usize);
