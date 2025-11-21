@@ -4,8 +4,8 @@ version = "0.0.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "An open source Bf-tree implementation"
-homepage = "https://github.com/raphaeldarley/quickstip"
-repository = "https://github.com/raphaeldarley/quickstep"
+homepage = "https://github.com/merlinai-com/quickstep"
+repository = "https://github.com/merlinai-com/quickstep"
 
 [dependencies]
 fastrand = "2.3.0"

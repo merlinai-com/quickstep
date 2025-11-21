@@ -4,9 +4,9 @@
 
 set -e
 
-REPO_URL="https://github.com/merlinai-com/quickstep-merlinai.git"
+REPO_URL="https://github.com/merlinai-com/quickstep.git"
 
-echo "🚀 Migrating Quickstep to merlinai-com/quickstep-merlinai..."
+echo "🚀 Migrating Quickstep to merlinai-com/quickstep..."
 echo ""
 
 # Step 1: Check if we're in the right directory
@@ -30,7 +30,7 @@ else
     echo "Please create the repo first:"
     echo "1. Go to: https://github.com/orgs/merlinai-com/repositories"
     echo "2. Click 'New repository'"
-    echo "3. Name it: quickstep-merlinai"
+    echo "3. Name it: quickstep"
     echo "4. Make it Public"
     echo "5. DO NOT initialize with README, .gitignore, or license (we have those)"
     echo "6. Then run this script again"
@@ -56,7 +56,7 @@ fi
 
 # Step 6: Change remote to new org repo
 echo ""
-echo "🔄 Changing remote to merlinai-com/quickstep-merlinai..."
+echo "🔄 Changing remote to merlinai-com/quickstep..."
 git remote set-url origin "${REPO_URL}"
 
 # Step 7: Add upstream for reference (optional)
