@@ -1,3 +1,11 @@
+//! Quickstep - A modern, concurrent embedded key-value store implementing the Bf-tree data structure.
+//!
+//! This implementation is based on the original work by [Raphael Darley](https://github.com/RaphaelDarley/quickstep).
+//! The core architecture and implementation are led by Raphael Darley.
+//!
+//! For more information, see the [README](https://github.com/merlinai-com/quickstep) and
+//! [design documentation](../design/).
+
 use std::path::{Path, PathBuf};
 
 use crate::{

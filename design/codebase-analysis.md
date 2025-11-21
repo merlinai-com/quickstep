@@ -1,7 +1,8 @@
 # Quickstep Codebase Analysis Report
 
 **Date:** November 21, 2024  
-**Repository:** https://github.com/RaphaelDarley/quickstep  
+**Repository:** https://github.com/merlinai-com/quickstep  
+**Original Implementation:** [RaphaelDarley/quickstep](https://github.com/RaphaelDarley/quickstep) (led by Raphael Darley)  
 **Codebase Size:** ~2,529 lines of Rust code  
 **Status:** Early development (version 0.0.0)
 

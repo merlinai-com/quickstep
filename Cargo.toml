@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 description = "An open source Bf-tree implementation"
 homepage = "https://github.com/merlinai-com/quickstep"
 repository = "https://github.com/merlinai-com/quickstep"
+authors = ["Raphael Darley <https://github.com/RaphaelDarley>"]
 
 [dependencies]
 fastrand = "2.3.0"
