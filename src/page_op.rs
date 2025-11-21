@@ -8,8 +8,7 @@ use crate::map_table::PageWriteGuard;
 use crate::node::InsufficientSpace;
 use crate::rand::rand_for_cache;
 use crate::types::{NodeMeta, NodeSize};
-use crate::QuickStep;
-use crate::{buffer::MiniPageBuffer, types::NodeRef};
+use crate::{buffer::MiniPageBuffer, types::NodeRef, QuickStep, QuickStepTx};
 
 impl<'a> PageGuard<'a> {
     pub fn get<'g>(
@@ -85,7 +84,7 @@ impl<'a> PageGuard<'a> {
 impl<'tx, 'a> WriteGuardWrapper<'tx, 'a> {
     pub fn try_put(
         &'tx mut self,
-        db: &QuickStep,
+        tx: &QuickStepTx<'a>,
         key: &[u8],
         val: &[u8],
     ) -> Result<(), SplitNeeded> {
@@ -96,34 +95,29 @@ impl<'tx, 'a> WriteGuardWrapper<'tx, 'a> {
 
         match node {
             NodeRef::Leaf(addr) => {
-                // account for size of fence keys
-                let byte_size = size_of::<NodeMeta>() * 4 + key.len() + val.len();
-                let size =
-                    NodeSize::from_byte_num(byte_size).expect("TODO: handle oversize values");
+                // Promote the on-disk leaf into a mini-page.
+                let mut guard = tx.new_mini_page(NodeSize::LeafPage, Some(addr));
 
-                let allocated = match db.cache.alloc(size) {
-                    Some(r) => r,
-                    None => {
-                        db.cache.evict(&db.map_table, &db.io_engine);
-                        db.cache
-                            .alloc(size)
-                            .expect("TODO: handle multiple evictions ")
-                    }
-                };
+                {
+                    let write_guard = guard.get_write_guard();
+                    let node_meta = match write_guard.node() {
+                        NodeRef::MiniPage(idx) => unsafe { tx.db.cache.get_meta_mut(idx) },
+                        NodeRef::Leaf(_) => unreachable!("new mini page should return a mini page"),
+                    };
 
-                // TODO: initialise allocated mini-page
+                    node_meta.try_put(key, val).map_err(|_| SplitNeeded)?;
+                }
 
-                // let leaf = ensure_page(&db.io_engine, &mut self.leaf, addr).expect("todo");
-                // leaf.as_ref().get(key);
-                todo!()
+                *self = guard;
+                Ok(())
             }
             NodeRef::MiniPage(mini_page_index) => {
                 // SAFETY: we have either a read or write lock
-                let node_meta = unsafe { db.cache.get_meta_mut(mini_page_index) };
+                let node_meta = unsafe { tx.db.cache.get_meta_mut(mini_page_index) };
 
                 match node_meta.try_put(key, val) {
                     Ok(_) => Ok(()),
-                    Err(_) => todo!(),
+                    Err(_) => Err(SplitNeeded),
                 }
 
                 // let prefix = node_meta.get_node_prefix();
@@ -215,4 +209,4 @@ fn ensure_page<'a>(
     Ok(leaf)
 }
 
-pub struct SplitNeeded(usize);
+pub struct SplitNeeded;

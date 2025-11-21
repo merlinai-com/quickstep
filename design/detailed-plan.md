@@ -32,21 +32,20 @@ This document tracks the step-by-step work for each Phase 1 task. For now it cov
 ## 1.2 – `put()` happy path (No splits)
 
 1. **Review current state / prerequisites**  
-   - `BPTree` root currently has no initialised leaf node; we need a bootstrap path (e.g., allocate the first leaf page during `QuickStep::new`).
-   - `NodeRef::Leaf` → `NodeRef::MiniPage` promotion requires calling `QuickStepTx::new_mini_page`, but `PageGuard::try_put` doesn’t yet have access to the transaction context.
-   - `IoEngine::get_new_addr` is `todo!()`; we need at least a monotonic counter so map-table entries have disk addresses even before persistence is finished.
+   - Root bootstrap, map-table entry, and IO address allocation completed in 1.1 (see above). Next challenge is safely promoting on-disk leaves into mini-pages when we hit `NodeRef::Leaf`.
 
 2. **Implementation plan**  
-   - Bootstrap root leaf:
-     - Initialise the root to point at a “dummy” empty leaf so inserts have somewhere to land.
-   - Complete the `NodeRef::Leaf` branch:
-     - Allocate a mini-page via the cache.
-     - Initialise it with fence keys + first key/value.
-     - Update the map table so future lookups resolve to the mini-page.
-   - Complete the `NodeRef::MiniPage` branch for the happy path:
-     - Use `NodeMeta::try_put`; handle success without touching the split logic.
-     - On `InsufficientSpace`, return `Err(SplitNeeded)` (still unimplemented).
-   - Ensure `QuickStepTx::put` returns `Ok(())` when the mini-page path succeeds.
+   - **Chosen approach (Option A)**: handle promotion inside `QuickStepTx::put`.
+     - `PageGuard::try_put` only deals with mini-pages. If it encounters a leaf, it returns a new outcome (`TryPutResult::Promote(PageId)`).
+     - `QuickStepTx::put` detects `Promote`, performs promotion itself (alloc mini-page via `self.new_mini_page`, copy leaf contents, update map table), then retries the mini-page path.
+     - Promotion steps:
+       1. Acquire write access to the disk leaf (similar to `get()` path).
+       2. Read existing KV pairs, insert them into the new mini-page using `NodeMeta::try_put_with_suffix`.
+       3. Update the map table entry to point at the mini-page; release disk guard.
+       4. Retry `try_put` on the new mini-page for the incoming key/value.
+   - `NodeRef::MiniPage` branch:
+     - Use `NodeMeta::try_put`; return `Ok` on success, `Err(SplitNeeded)` when out of space.
+   - Split logic remains `todo!()` for Phase 1.3.
 
 3. **Testing**  
    - Add `tests/quickstep_put_basic.rs` covering:
@@ -60,4 +59,16 @@ This document tracks the step-by-step work for each Phase 1 task. For now it cov
    - Only commit after tests pass (Rule 10) and after “guc”.
 
 ---
+
+### Alternative approaches considered (rejected for now)
+
+- **Option B – pass a promotion context into `PageGuard::try_put`**  
+  *Pros*: keeps promotion logic local to the guard.  
+  *Cons*: requires a complicated helper struct to juggle lifetimes and mutable borrows; still easy to violate Rust’s aliasing rules. Given this is foundation code, we prefer simplicity.
+
+- **Option C – defer promotion (mutate only disk leaves)**  
+  *Pros*: quick hack to unblock `put()`.  
+  *Cons*: contradicts the Bf-tree design (mini-pages are the core feature) and doesn’t test the code we ultimately need. Not acceptable for a database storage engine we expect to rely on.
+
+Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
 
