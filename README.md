@@ -1,6 +1,6 @@
 # Quickstep
 
-A modern, concurrent embedded key-value store implementing the [Bf-tree](https://github.com/XiangpengHao/bf-tree-docs) data structure in Rust.
+A modern, concurrent embedded key-value store implementing the [Bf-tree](https://github.com/XiangpengHao/bf-tree-docs) data structure in Rust. The core implementation is led by [Raphael Darley](https://github.com/RaphaelDarley); this repository tracks MerlinAI’s public fork and contributions.
 
 ## Overview
 
