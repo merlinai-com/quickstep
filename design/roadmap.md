@@ -59,6 +59,28 @@
 | 19 | Create CONTRIBUTING.md | Outline process, coding standards |
 | 20 | Publish roadmap updates quarterly | Keep this doc current |
 
+## Phase 6 – Testing & Benchmarking
+
+| # | Task | Notes |
+|---|------|-------|
+| 21 | Establish unit tests per module | `btree`, `node`, `buffer`, `map_table`, etc. |
+| 22 | Add integration tests using `QuickStep::new()` | Basic put/get/delete flows once core functions land |
+| 23 | Introduce property-based testing (`proptest`) | Verify invariants (sorted keys, prefix compression) |
+| 24 | Build stress/simulation harness | Randomized multi-threaded ops to smoke out races |
+| 25 | Set up Criterion benchmarks | Micro (node/buffer) + macro (full KV workloads) |
+| 26 | Record baseline perf vs RocksDB/LMDB | Track improvements/regressions |
+
+## Phase 7 – HelixDB Integration
+
+| # | Task | Notes |
+|---|------|-------|
+| 27 | Document HelixDB storage trait expectations | Summarize key APIs & config knobs |
+| 28 | Scaffold Quickstep adapter for HelixDB | Implement trait wrapper around `QuickStep` |
+| 29 | Add configuration flag in HelixDB to select Quickstep | CLI / config integration |
+| 30 | Run HelixDB’s integration tests with Quickstep backend | Validate functional parity |
+| 31 | Build HelixDB workload benchmark harness | Compare LMDB vs Quickstep for graph ops |
+| 32 | Prepare PR plan for upstream HelixDB | Once stable, publish adapter changes |
+
 ## Open Questions
 
 - What durability guarantees do we aim for initially? (Best-effort vs crash-safe)
