@@ -10,3 +10,6 @@ authors = ["Raphael Darley <https://github.com/RaphaelDarley>"]
 
 [dependencies]
 fastrand = "2.3.0"
+
+[dev-dependencies]
+tempfile = "3.10.1"

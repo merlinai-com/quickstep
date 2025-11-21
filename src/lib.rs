@@ -63,6 +63,22 @@ pub struct QuickStepConfig {
     cache_size_lg: usize,
 }
 
+impl QuickStepConfig {
+    pub fn new<P: Into<PathBuf>>(
+        path: P,
+        inner_node_upper_bound: u32,
+        leaf_upper_bound: u64,
+        cache_size_lg: usize,
+    ) -> QuickStepConfig {
+        QuickStepConfig {
+            path: path.into(),
+            inner_node_upper_bound,
+            leaf_upper_bound,
+            cache_size_lg,
+        }
+    }
+}
+
 impl QuickStep {
     pub fn new(config: QuickStepConfig) -> QuickStep {
         let QuickStepConfig {
@@ -87,7 +103,7 @@ impl QuickStep {
     }
 
     /// Create a new transaction for isolated operations
-    pub fn tx(&self) -> QuickStepTx {
+    pub fn tx(&self) -> QuickStepTx<'_> {
         // coordination is done via the locks so it can just hold a reference to the db
         QuickStepTx {
             db: self,

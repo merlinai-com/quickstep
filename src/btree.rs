@@ -61,7 +61,7 @@ impl BPTree {
         }
     }
 
-    pub fn read_root(&self) -> Result<RootReadLock, BPRestart> {
+    pub fn read_root(&self) -> Result<RootReadLock<'_>, BPRestart> {
         let version = self.root_vlock.load(Ordering::Acquire);
         if is_locked_or_obsolete(version) {
             return Err(BPRestart);
@@ -87,7 +87,7 @@ impl BPTree {
         }
     }
 
-    pub fn read_inner(&self, node: BPNodeId) -> Result<InnerReadGuard, BPRestart> {
+    pub fn read_inner(&self, node: BPNodeId) -> Result<InnerReadGuard<'_>, BPRestart> {
         let node = unsafe { self.slab.add(node.0 as usize).as_ref() };
 
         let version = node.vlock.load(Ordering::Acquire);
@@ -101,12 +101,12 @@ impl BPTree {
             }),
         }
     }
-    pub fn write_inner(&self, node: BPNodeId) -> Result<InnerWriteGuard, BPRestart> {
+    pub fn write_inner(&self, node: BPNodeId) -> Result<InnerWriteGuard<'_>, BPRestart> {
         let read = self.read_inner(node)?;
         read.upgrade()
     }
 
-    pub fn read_traverse_leaf(&self, key: &[u8]) -> Result<ReadRes, QSError> {
+    pub fn read_traverse_leaf(&self, key: &[u8]) -> Result<ReadRes<'_>, QSError> {
         for _ in 0..SPIN_RETRIES {
             if let Ok(leaf) = self.try_read_traverse_leaf(key) {
                 return Ok(leaf);
@@ -115,7 +115,7 @@ impl BPTree {
         Err(QSError::OLCRetriesExceeded)
     }
 
-    fn try_read_traverse_leaf(&self, key: &[u8]) -> Result<ReadRes, BPRestart> {
+    fn try_read_traverse_leaf(&self, key: &[u8]) -> Result<ReadRes<'_>, BPRestart> {
         let root_guard = self.read_root()?;
 
         let mut underflow_point = WriteLockPoint::Root;

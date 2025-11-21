@@ -1,5 +1,13 @@
 # Coding History
 
+# Coding History
+
+#### 2025-11-21 21:03 UTC [pending] [main]
+
+- Added `QuickStepConfig::new` helper plus a `tempfile` dev-dependency to simplify integration tests.
+- Created `tests/quickstep_new.rs` smoke test to ensure `QuickStep::new` initialises disk + cache correctly.
+- Ran `cargo test quickstep_new_smoke` under rustup stable 1.91.1.
+
 #### 2025-11-21 18:41 UTC [pending] [main]
 
 - Implemented `MiniPageBuffer::new` with owned backing storage and initialised freelists/head/tail pointers.

@@ -1,6 +1,5 @@
 use std::{
     fs::{self, File, OpenOptions},
-    mem::MaybeUninit,
     os::unix::fs::FileExt,
     path::Path,
 };
@@ -30,8 +29,7 @@ impl IoEngine {
 
     /// Get the page of the given address
     pub fn get_page(&self, page_addr: u64) -> DiskLeaf {
-        // SAFETY: this immediately overwritten
-        let mut out: Box<[u8; 4096]> = Box::new(unsafe { MaybeUninit::uninit().assume_init() });
+        let mut out: Box<[u8; 4096]> = Box::new([0u8; 4096]);
 
         let offset = calc_offset(page_addr);
 

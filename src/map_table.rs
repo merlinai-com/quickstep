@@ -40,7 +40,7 @@ impl MapTable {
 }
 
 impl MapTable {
-    pub fn create_page_entry(&self, node: MiniPageIndex) -> PageWriteGuard {
+    pub fn create_page_entry(&self, node: MiniPageIndex) -> PageWriteGuard<'_> {
         let target_idx = self.next_free.fetch_add(1, Ordering::AcqRel);
 
         if target_idx >= self.cap {
@@ -63,7 +63,7 @@ impl MapTable {
         }
     }
 
-    pub fn read_page_entry(&self, page: PageId) -> Result<PageReadGuard, QSError> {
+    pub fn read_page_entry(&self, page: PageId) -> Result<PageReadGuard<'_>, QSError> {
         let entry_ref = self.get_ref(page);
         let mut entry = PageEntry::from_repr(entry_ref.load(Ordering::Acquire));
 
@@ -106,7 +106,7 @@ impl MapTable {
     }
 
     // TODO: refactor to take read lock and upgrade
-    pub fn write_page_entry(&self, page: PageId) -> Result<PageWriteGuard, QSError> {
+    pub fn write_page_entry(&self, page: PageId) -> Result<PageWriteGuard<'_>, QSError> {
         let entry_ref = self.get_ref(page);
         let mut entry = PageEntry(entry_ref.load(Ordering::Acquire));
 
@@ -344,7 +344,7 @@ impl PageEntry {
         PageEntry(val)
     }
 
-    pub fn get_ref(&self) -> NodeRef {
+    pub fn get_ref(&self) -> NodeRef<'_> {
         let repr = self.0;
 
         let is_leaf = (repr >> 15) & 1 == 1;

@@ -1,5 +1,22 @@
 # Changelog
 
+# Changelog
+
+#### 2025-11-21 21:03 UTC [pending] [main]
+
+##### add QuickStep::new smoke tests
+
+- Added `tests/quickstep_new.rs` verifying:
+
+  * `QuickStep::new` succeeds with a temporary directory config
+  * Transactions can be created immediately after initialisation
+  * The expected `quickstep.db` backing file is created on disk
+
+- Supporting changes:
+
+  * `QuickStepConfig::new` constructor for easier config creation in tests
+  * `tempfile` dev-dependency for temporary directories
+
 #### 2025-11-21 18:41 UTC [pending] [main]
 
 ##### initialise QuickStep::new and support code
