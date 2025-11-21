@@ -1,14 +1,9 @@
-use std::cell::UnsafeCell;
-
 use crate::error::QSError;
-use crate::io_engine::{self, DiskLeaf, IoEngine};
+use crate::io_engine::{DiskLeaf, IoEngine};
 use crate::lock_manager::{GuardWrapper, PageGuard, WriteGuardWrapper};
-
-use crate::map_table::PageWriteGuard;
 use crate::node::InsufficientSpace;
-use crate::rand::rand_for_cache;
 use crate::types::{NodeMeta, NodeSize};
-use crate::{buffer::MiniPageBuffer, types::NodeRef, QuickStep};
+use crate::{buffer::MiniPageBuffer, types::NodeRef};
 
 impl<'a> PageGuard<'a> {
     pub fn get<'g>(
@@ -82,29 +77,18 @@ impl<'a> PageGuard<'a> {
 }
 
 impl<'tx, 'a> WriteGuardWrapper<'tx, 'a> {
-    pub fn try_put(
-        &'tx mut self,
-        db: &QuickStep,
-        key: &[u8],
-        val: &[u8],
-    ) -> Result<(), SplitNeeded> {
-        // TODO: pass fence keys as args
+    pub fn try_put(&mut self, cache: &MiniPageBuffer, key: &[u8], val: &[u8]) -> TryPutResult {
         let write_guard = self.get_write_guard();
 
-        let node = write_guard.node();
-
-        match node {
-            NodeRef::Leaf(addr) => {
-                let leaf = self
-                    .load_leaf(&db.io_engine, addr)
-                    .map_err(|_| SplitNeeded)?;
-                let meta = leaf.as_mut();
-                meta.try_put(key, val).map_err(|_| SplitNeeded)
-            }
+        match write_guard.node() {
+            NodeRef::Leaf(addr) => TryPutResult::NeedsPromotion(addr),
             NodeRef::MiniPage(mini_page_index) => {
-                // SAFETY: we have either a read or write lock
-                let node_meta = unsafe { db.cache.get_meta_mut(mini_page_index) };
-                node_meta.try_put(key, val).map_err(|_| SplitNeeded)
+                // SAFETY: we hold the write lock for this node
+                let node_meta = unsafe { cache.get_meta_mut(mini_page_index) };
+                match node_meta.try_put(key, val) {
+                    Ok(_) => TryPutResult::Success,
+                    Err(_) => TryPutResult::NeedsSplit,
+                }
             }
         }
     }
@@ -177,4 +161,8 @@ fn ensure_page<'a>(
     Ok(leaf)
 }
 
-pub struct SplitNeeded;
+pub enum TryPutResult {
+    Success,
+    NeedsPromotion(u64),
+    NeedsSplit,
+}

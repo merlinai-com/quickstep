@@ -1,5 +1,13 @@
 # Changelog
 
+#### 2025-11-21 22:54 UTC [pending] [main]
+
+##### Phase 1.2 Option A – promote leaves into mini-pages
+
+- Refactored `PageGuard::try_put` to emit a `TryPutResult` (`Success`, `NeedsPromotion`, `NeedsSplit`) and limited it to mini-pages; `QuickStepTx::put` now loops via `try_put_with_promotion`, promoting on-disk leaves with `PageWriteGuard::set_mini_page` before retrying the insert.
+- Added `LockManager`/`MapTable` glue so promotions copy disk leaves into the cache, update the map-table entry in place, and keep the existing page ID; documented the new flow in `design/detailed-plan.md` and `design/phase-1-tests.md`.
+- Tests: `cargo fmt && cargo test quickstep_new_smoke` and `cargo test quickstep_put_basic` (both PASS, legacy warnings remain due to unfinished modules).
+
 #### 2025-11-21 22:40 UTC [pending] [main]
 
 ##### Phase 1.2 happy-path put test (disk leaf mutation)

@@ -6,7 +6,10 @@
 //! For more information, see the [README](https://github.com/merlinai-com/quickstep) and
 //! [design documentation](../design/).
 
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    ptr,
+};
 
 use crate::{
     btree::{BPRestart, BPRootInfo, BPTree, OpType},
@@ -16,7 +19,7 @@ use crate::{
     lock_manager::{LockManager, PageGuard, WriteGuardWrapper},
     map_table::{MapTable, PageReadGuard},
     node::InsufficientSpace,
-    page_op::SplitNeeded,
+    page_op::TryPutResult,
     types::{NodeMeta, NodeSize},
 };
 
@@ -149,24 +152,22 @@ impl<'db> QuickStepTx<'db> {
             .lock_manager
             .get_upgrade_or_acquire_write_lock(&self.db.map_table, res.page)?;
 
-        // Try to add to that page, increasing the size of mini-pages
-        // But there still might not be enough space so we'd need to split
-        match page_guard.try_put(&self.db, key, val) {
-            Ok(_) => return Ok(()),
-            Err(SplitNeeded) => {}
+        match Self::try_put_with_promotion(self.db, &mut page_guard, key, val)? {
+            TryPutResult::Success => return Ok(()),
+            TryPutResult::NeedsSplit => {
+                // We know which locks we need, so try to acquire them, if we fail then it might
+                // be because another thread modified the tree which we weren't looking, so we should restart
+                let _locks = self
+                    .db
+                    .inner_nodes
+                    .write_lock(res.overflow_point, OpType::Split, key);
+
+                let _new_guard = self.new_mini_page(NodeSize::LeafPage, None);
+
+                todo!("leaf splitting is not yet implemented");
+            }
+            TryPutResult::NeedsPromotion(_) => unreachable!("promotion handled before returning"),
         }
-
-        // We know which locks we need, so try to acquire them, if we fail then it might
-        // be because another thread modified the tree which we weren't looking, so we should restart
-
-        let locks = self
-            .db
-            .inner_nodes
-            .write_lock(res.overflow_point, OpType::Split, key);
-
-        let new_guard = self.new_mini_page(NodeSize::LeafPage, None);
-
-        todo!()
     }
 
     pub fn abort(self) {}
@@ -183,6 +184,44 @@ fn resolve_data_path(path: &Path) -> PathBuf {
 }
 
 impl<'db> QuickStepTx<'db> {
+    fn try_put_with_promotion<'guard>(
+        db: &'db QuickStep,
+        page_guard: &mut WriteGuardWrapper<'guard, 'db>,
+        key: &[u8],
+        val: &[u8],
+    ) -> Result<TryPutResult, QSError> {
+        let attempt = page_guard.try_put(&db.cache, key, val);
+        match attempt {
+            TryPutResult::NeedsPromotion(addr) => {
+                Self::promote_leaf_to_mini_page(db, page_guard, addr)?;
+                Self::try_put_with_promotion(db, page_guard, key, val)
+            }
+            other => Ok(other),
+        }
+    }
+
+    fn promote_leaf_to_mini_page(
+        db: &'db QuickStep,
+        page_guard: &mut WriteGuardWrapper<'_, 'db>,
+        disk_addr: u64,
+    ) -> Result<(), QSError> {
+        let disk_leaf = page_guard.load_leaf(&db.io_engine, disk_addr)?;
+        let cache_index = db
+            .cache
+            .alloc(NodeSize::LeafPage)
+            .ok_or(QSError::CacheExhausted)?;
+
+        unsafe {
+            let dst = db.cache.get_meta_ptr(cache_index) as *mut u8;
+            let src = disk_leaf.as_ref() as *const NodeMeta as *const u8;
+            ptr::copy_nonoverlapping(src, dst, NodeSize::LeafPage.size_in_bytes());
+            let mini_index = MiniPageIndex::new(cache_index);
+            page_guard.get_write_guard().set_mini_page(mini_index);
+        }
+
+        Ok(())
+    }
+
     fn new_mini_page<'tx>(
         &'tx mut self,
         size: NodeSize,

@@ -39,15 +39,14 @@ Each subsection lists three things:
 - Create `tests/quickstep_put_basic.rs`.
 - Steps:
   1. Call `QuickStep::new()` with a cache large enough for one mini-page.
-  2. Start a transaction → `put` 3–5 short keys → `commit`.
+  2. Start a transaction → first `put` should force promotion from disk leaf to cache → insert 3–5 short keys → `commit`.
   3. New transaction → `get` each key → assert equality.
   4. Optionally call `tx().get()` for a missing key to confirm `None`.
-- Instrumentation: temporarily expose a debug counter (feature-gated) to assert `SplitNeeded` was never triggered during the test.
+- Instrumentation: add a debug hook (feature-gated) to assert `TryPutResult::NeedsSplit` is never returned during this test and that exactly one promotion occurred.
 
 ### Current results
 - Command: `cargo fmt && cargo test quickstep_new_smoke` (this run also executes `tests/quickstep_put_basic`).
-- Outcome: **PASS** – the happy-path integration test (`insert_and_read_back`) succeeds by writing directly to the on-disk leaf. The compiler still emits numerous warnings (unused imports, unfinished TODOs); those are tracked separately and do not affect functionality.
-- Note: Mini-page promotion is still pending; for now inserts mutate the disk page in place. Future phases will reintroduce the cache.
+- Outcome: **PASS** – the happy-path integration test (`insert_and_read_back`) now exercises Option A: the first insert promotes the disk leaf into a mini-page, subsequent inserts write to the cache, and no split requests are observed. The compiler still emits numerous warnings (unused imports, unfinished TODOs); those are tracked separately and do not affect functionality.
 
 ---
 

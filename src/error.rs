@@ -4,4 +4,6 @@ pub enum QSError {
     PageLockFail,
     /// The number of retries on inner nodes was exceeded
     OLCRetriesExceeded,
+    /// The mini-page buffer could not allocate space for a promotion
+    CacheExhausted,
 }

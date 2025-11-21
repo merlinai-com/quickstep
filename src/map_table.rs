@@ -280,6 +280,13 @@ impl<'a> PageWriteGuard<'a> {
         self.node.get_ref()
     }
 
+    pub fn set_mini_page(&mut self, mini_page: MiniPageIndex<'a>) {
+        let entry = PageEntry::new_write_locked(mini_page);
+        let entry_ref = self.map_table.get_ref(self.page);
+        entry_ref.store(entry.to_repr(), Ordering::Release);
+        self.node = entry;
+    }
+
     // pub fn node_mut<'g>(&'g mut self)
 }
 
@@ -339,7 +346,7 @@ impl<'a> Drop for PageWriteGuard<'a> {
 /// | address | is_leaf | write pending | lock state
 ///     48b      1b           1b            14b
 // TODO: option to wait on two 32bit parts using futex
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct PageEntry(u64);
 
