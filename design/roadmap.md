@@ -4,7 +4,7 @@
 
 1. **Honor the reference implementation** – keep Raphael Darley’s architecture intact unless we have clear evidence for change.
 2. **Build confidence iteratively** – finish core data-path correctness before layering more features.
-3. **Keep HelixDB integration front-and-center** – this fork exists to give the HelixDB team a bespoke storage engine.
+3. **Keep HelixDB integration front-and-centre** – this fork exists to help give the HelixDB team a bespoke storage engine.
 
 ## Phase 0 – Repository Setup ✅
 
