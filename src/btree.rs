@@ -54,11 +54,15 @@ impl BPTree {
         BPTree {
             slab,
             cap: inner_node_upper_bound,
-            root: 1 << 48,
+            root: 0,
             root_vlock: AtomicU64::new(0),
             next_free: AtomicU32::new(1),
             free_list: AtomicU32::new(u32::MAX),
         }
+    }
+
+    pub fn set_leaf_root(&mut self, page: crate::map_table::PageId) {
+        self.root = page.0;
     }
 
     pub fn read_root(&self) -> Result<RootReadLock<'_>, BPRestart> {

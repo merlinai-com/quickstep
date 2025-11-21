@@ -4,10 +4,13 @@ use std::{
     path::Path,
 };
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::{lock_manager::WriteGuardWrapper, types::NodeMeta};
 
 pub struct IoEngine {
     file: File,
+    next_addr: AtomicU64,
 }
 
 impl IoEngine {
@@ -24,7 +27,17 @@ impl IoEngine {
             .create(true)
             .open(path)?;
 
-        Ok(IoEngine { file })
+        // Ensure at least metadata page + first data page exist
+        let min_len = 2 * 4096;
+        let current_len = file.metadata()?.len();
+        if current_len < min_len {
+            file.set_len(min_len as u64)?;
+        }
+
+        Ok(IoEngine {
+            file,
+            next_addr: AtomicU64::new(0),
+        })
     }
 
     /// Get the page of the given address
@@ -48,7 +61,7 @@ impl IoEngine {
     }
 
     pub fn get_new_addr(&self) -> u64 {
-        todo!()
+        self.next_addr.fetch_add(1, Ordering::AcqRel)
     }
 }
 

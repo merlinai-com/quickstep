@@ -3,7 +3,7 @@ use std::{
     f64::consts::E,
     iter::Map,
     marker::PhantomData,
-    ptr::NonNull,
+    ptr::{self, NonNull},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         RwLock,
@@ -33,13 +33,29 @@ impl MapTable {
 
         MapTable {
             indirection_arr: arr,
-            next_free: AtomicUsize::new(usize::MAX),
+            next_free: AtomicUsize::new(0),
             cap: leaf_upper_bound as usize,
         }
     }
 }
 
 impl MapTable {
+    pub fn init_leaf_entry(&self, disk_addr: u64) -> PageId {
+        if self.cap == 0 {
+            todo!("map table capacity must be > 0");
+        }
+
+        let entry = PageEntry::leaf(disk_addr);
+        unsafe {
+            let ptr = self.indirection_arr.as_ptr();
+            ptr.write(AtomicU64::new(entry.to_repr()));
+        }
+
+        self.next_free.store(1, Ordering::Release);
+
+        PageId(0)
+    }
+
     pub fn create_page_entry(&self, node: MiniPageIndex) -> PageWriteGuard<'_> {
         let target_idx = self.next_free.fetch_add(1, Ordering::AcqRel);
 
@@ -334,6 +350,11 @@ impl PageEntry {
     fn new_write_locked<'g>(node: MiniPageIndex<'g>) -> PageEntry {
         let repr = node.index << 16;
         PageEntry(repr as u64).set_state(WRITE_LOCK_STATE)
+    }
+
+    fn leaf(addr: u64) -> PageEntry {
+        let repr = (addr << 16) | (1 << 15);
+        PageEntry(repr)
     }
 
     fn to_repr(self) -> u64 {

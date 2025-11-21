@@ -94,12 +94,18 @@ impl QuickStep {
             IoEngine::open(&data_path).expect("failed to open quickstep data file for writing");
         let cache = MiniPageBuffer::new(cache_size_lg);
 
-        QuickStep {
+        let mut quickstep = QuickStep {
             inner_nodes: BPTree::new(inner_node_upper_bound),
             cache,
             io_engine,
             map_table: MapTable::new(leaf_upper_bound),
-        }
+        };
+
+        // initialise root leaf (page 0 for now)
+        let root_page = quickstep.map_table.init_leaf_entry(0);
+        quickstep.inner_nodes.set_leaf_root(root_page);
+
+        quickstep
     }
 
     /// Create a new transaction for isolated operations
