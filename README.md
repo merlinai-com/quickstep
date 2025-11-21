@@ -119,7 +119,7 @@ This repository includes comprehensive design documentation:
 
 - [`design/codebase-analysis.md`](design/codebase-analysis.md) - Detailed analysis of the codebase architecture
 - [`design/bf-tree-docs/`](design/bf-tree-docs/) - Reference materials from the Bf-tree paper authors
-- [`design/roadmap.md`](design/roadmap.md) - Phased roadmap and upcoming work
+- [`design/roadmap.md`](design/roadmap.md) - Phased roadmap and upcoming work; tasks are enumerated legal-style (`phase.task`) so dependencies and numbering remain clear
 
 ## Contributing
 
