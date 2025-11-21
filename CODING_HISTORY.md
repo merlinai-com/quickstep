@@ -2,11 +2,17 @@
 
 # Coding History
 
-#### 2025-11-21 21:03 UTC [pending] [main]
+#### 2025-11-21 22:40 UTC [pending] [main]
 
-- Added `QuickStepConfig::new` helper plus a `tempfile` dev-dependency to simplify integration tests.
-- Created `tests/quickstep_new.rs` smoke test to ensure `QuickStep::new` initialises disk + cache correctly.
-- Ran `cargo test quickstep_new_smoke` under rustup stable 1.91.1.
+- Reworked `PageGuard::try_put` to mutate on-disk leaves directly (no mini-page promotion yet) and added `tests/quickstep_put_basic.rs`.
+- Ran `cargo fmt && cargo test quickstep_new_smoke` (which also executes the new put test); build succeeds with the existing warnings.
+- Updated `design/detailed-plan.md` and `design/phase-1-tests.md` to reflect the interim strategy and recorded the passing test results.
+
+#### 2025-11-21 22:15 UTC [pending] [main]
+
+- Captured the promotion options for Phase 1.2 and attempted Option A; build currently fails due to borrow-checker issues (see cargo output). Future commits supersede this attempt.
+
+#### 2025-11-21 21:03 UTC [pending] [main]
 
 #### 2025-11-21 18:41 UTC [pending] [main]
 

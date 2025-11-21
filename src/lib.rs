@@ -151,14 +151,7 @@ impl<'db> QuickStepTx<'db> {
 
         // Try to add to that page, increasing the size of mini-pages
         // But there still might not be enough space so we'd need to split
-        let tx_ptr: *mut QuickStepTx<'db> = self;
-        let result = unsafe {
-            let tx_ptr = self as *mut QuickStepTx<'db>;
-            let guard_ptr = &mut page_guard as *mut WriteGuardWrapper<'_, 'db>;
-            (*guard_ptr).try_put(&mut *tx_ptr, key, val)
-        };
-
-        match result {
+        match page_guard.try_put(&self.db, key, val) {
             Ok(_) => return Ok(()),
             Err(SplitNeeded) => {}
         }

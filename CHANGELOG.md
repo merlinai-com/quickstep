@@ -1,6 +1,19 @@
 # Changelog
 
-# Changelog
+#### 2025-11-21 22:40 UTC [pending] [main]
+
+##### Phase 1.2 happy-path put test (disk leaf mutation)
+
+- `PageGuard::try_put` now mutates the on-disk leaf directly when map entries still reference `NodeRef::Leaf`; mini-page promotion remains TODO for a later phase.
+- Added `tests/quickstep_put_basic.rs::insert_and_read_back`, executed via `cargo fmt && cargo test quickstep_new_smoke` (same command also runs the new test). Compiler warnings remain unchanged.
+- Updated `design/detailed-plan.md` and `design/phase-1-tests.md` to document the interim approach and current test results.
+
+#### 2025-11-21 22:15 UTC [pending] [main]
+
+##### WIP phase 1.2 promotion sketch (tests failing)
+
+- Documented promotion options in design/detailed-plan.md and began implementing Option A (promotion handled in QuickStepTx::put).
+- Added preliminary quickstep_put_basic integration test; build currently fails due to borrow-checker issues (see cargo test output).
 
 #### 2025-11-21 21:03 UTC [pending] [main]
 

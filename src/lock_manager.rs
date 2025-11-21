@@ -2,7 +2,7 @@ use std::{collections::HashMap, mem};
 
 use crate::{
     error::QSError,
-    io_engine::DiskLeaf,
+    io_engine::{DiskLeaf, IoEngine},
     map_table::{MapTable, PageId, PageReadGuard, PageWriteGuard},
 };
 
@@ -110,6 +110,14 @@ impl<'tx, 'a> WriteGuardWrapper<'tx, 'a> {
         };
         out
     }
+
+    pub fn load_leaf<'b>(
+        &'b mut self,
+        io: &IoEngine,
+        addr: u64,
+    ) -> Result<&'b mut DiskLeaf, QSError> {
+        self.0.load_leaf(io, addr)
+    }
 }
 
 pub struct PageGuard<'a> {
@@ -120,6 +128,22 @@ pub struct PageGuard<'a> {
 impl<'a> PageGuard<'a> {
     pub fn is_write(&self) -> bool {
         matches!(self.guard_inner, GuardWrapper::Write(_))
+    }
+
+    pub fn load_leaf<'g>(
+        &'g mut self,
+        io: &IoEngine,
+        addr: u64,
+    ) -> Result<&'g mut DiskLeaf, QSError> {
+        let leaf = match self.leaf {
+            Some(ref mut l) => l,
+            None => {
+                let new_leaf = io.get_page(addr);
+                self.leaf = Some(new_leaf);
+                self.leaf.as_mut().expect("just set leaf to Some")
+            }
+        };
+        Ok(leaf)
     }
 
     /// Upgrade to a write transaction, if not already

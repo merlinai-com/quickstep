@@ -35,14 +35,7 @@ This document tracks the step-by-step work for each Phase 1 task. For now it cov
    - Root bootstrap, map-table entry, and IO address allocation completed in 1.1 (see above). Next challenge is safely promoting on-disk leaves into mini-pages when we hit `NodeRef::Leaf`.
 
 2. **Implementation plan**  
-   - **Chosen approach (Option A)**: handle promotion inside `QuickStepTx::put`.
-     - `PageGuard::try_put` only deals with mini-pages. If it encounters a leaf, it returns a new outcome (`TryPutResult::Promote(PageId)`).
-     - `QuickStepTx::put` detects `Promote`, performs promotion itself (alloc mini-page via `self.new_mini_page`, copy leaf contents, update map table), then retries the mini-page path.
-     - Promotion steps:
-       1. Acquire write access to the disk leaf (similar to `get()` path).
-       2. Read existing KV pairs, insert them into the new mini-page using `NodeMeta::try_put_with_suffix`.
-       3. Update the map table entry to point at the mini-page; release disk guard.
-       4. Retry `try_put` on the new mini-page for the incoming key/value.
+   - **Current implementation (temporary)**: mutate the on-disk leaf directly when inserts hit `NodeRef::Leaf`. This trades off cache benefits for simplicity and gets the happy-path tests passing. Once Phase 1 is stable, we’ll revisit Option A (promotion inside `QuickStepTx::put`) so mini-pages behave as designed.
    - `NodeRef::MiniPage` branch:
      - Use `NodeMeta::try_put`; return `Ok` on success, `Err(SplitNeeded)` when out of space.
    - Split logic remains `todo!()` for Phase 1.3.

@@ -45,7 +45,9 @@ Each subsection lists three things:
 - Instrumentation: temporarily expose a debug counter (feature-gated) to assert `SplitNeeded` was never triggered during the test.
 
 ### Current results
-- **Pending** – implementation and tests not yet written.
+- Command: `cargo fmt && cargo test quickstep_new_smoke` (this run also executes `tests/quickstep_put_basic`).
+- Outcome: **PASS** – the happy-path integration test (`insert_and_read_back`) succeeds by writing directly to the on-disk leaf. The compiler still emits numerous warnings (unused imports, unfinished TODOs); those are tracked separately and do not affect functionality.
+- Note: Mini-page promotion is still pending; for now inserts mutate the disk page in place. Future phases will reintroduce the cache.
 
 ---
 

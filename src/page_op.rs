@@ -8,7 +8,7 @@ use crate::map_table::PageWriteGuard;
 use crate::node::InsufficientSpace;
 use crate::rand::rand_for_cache;
 use crate::types::{NodeMeta, NodeSize};
-use crate::{buffer::MiniPageBuffer, types::NodeRef, QuickStep, QuickStepTx};
+use crate::{buffer::MiniPageBuffer, types::NodeRef, QuickStep};
 
 impl<'a> PageGuard<'a> {
     pub fn get<'g>(
@@ -84,7 +84,7 @@ impl<'a> PageGuard<'a> {
 impl<'tx, 'a> WriteGuardWrapper<'tx, 'a> {
     pub fn try_put(
         &'tx mut self,
-        tx: &QuickStepTx<'a>,
+        db: &QuickStep,
         key: &[u8],
         val: &[u8],
     ) -> Result<(), SplitNeeded> {
@@ -95,48 +95,16 @@ impl<'tx, 'a> WriteGuardWrapper<'tx, 'a> {
 
         match node {
             NodeRef::Leaf(addr) => {
-                // Promote the on-disk leaf into a mini-page.
-                let mut guard = tx.new_mini_page(NodeSize::LeafPage, Some(addr));
-
-                {
-                    let write_guard = guard.get_write_guard();
-                    let node_meta = match write_guard.node() {
-                        NodeRef::MiniPage(idx) => unsafe { tx.db.cache.get_meta_mut(idx) },
-                        NodeRef::Leaf(_) => unreachable!("new mini page should return a mini page"),
-                    };
-
-                    node_meta.try_put(key, val).map_err(|_| SplitNeeded)?;
-                }
-
-                *self = guard;
-                Ok(())
+                let leaf = self
+                    .load_leaf(&db.io_engine, addr)
+                    .map_err(|_| SplitNeeded)?;
+                let meta = leaf.as_mut();
+                meta.try_put(key, val).map_err(|_| SplitNeeded)
             }
             NodeRef::MiniPage(mini_page_index) => {
                 // SAFETY: we have either a read or write lock
-                let node_meta = unsafe { tx.db.cache.get_meta_mut(mini_page_index) };
-
-                match node_meta.try_put(key, val) {
-                    Ok(_) => Ok(()),
-                    Err(_) => Err(SplitNeeded),
-                }
-
-                // let prefix = node_meta.get_node_prefix();
-                // match node_meta
-                //     .binary_search(prefix.len(), key)
-                //     .map(|i| node_meta.get_kv_meta(i))
-                // {
-                //     Ok(kv) => {
-
-                //         // Value is already cached, so early return
-                //         return Ok(val);
-                //     }
-                //     Err(_) => {}
-                // }
-
-                // let leaf_addr = node_meta.leaf();
-                // let leaf = ensure_page(io, &mut self.leaf, leaf_addr)?;
-
-                // leaf.as_ref().get(key)
+                let node_meta = unsafe { db.cache.get_meta_mut(mini_page_index) };
+                node_meta.try_put(key, val).map_err(|_| SplitNeeded)
             }
         }
     }
