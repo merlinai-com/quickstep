@@ -2,7 +2,7 @@
 
 ## Guiding Principles
 
-1. **Honor the reference implementation** – keep Raphael Darley’s architecture intact unless we have clear evidence for change.
+1. **Honour the reference implementation** – keep Raphael Darley’s architecture intact unless we have clear evidence for change.
 2. **Build confidence iteratively** – finish core data-path correctness before layering more features.
 3. **Keep HelixDB integration front-and-centre** – this fork exists to help give the HelixDB team a bespoke storage engine.
 
@@ -74,7 +74,7 @@
 
 | # | Task | Notes |
 |---|------|-------|
-| 27 | Document HelixDB storage trait expectations | Summarize key APIs & config knobs |
+| 27 | Document HelixDB storage trait expectations | Summarise key APIs & config knobs |
 | 28 | Scaffold Quickstep adapter for HelixDB | Implement trait wrapper around `QuickStep` |
 | 29 | Add configuration flag in HelixDB to select Quickstep | CLI / config integration |
 | 30 | Run HelixDB’s integration tests with Quickstep backend | Validate functional parity |

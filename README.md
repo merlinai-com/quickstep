@@ -4,7 +4,7 @@ A modern, concurrent embedded key-value store implementing the [Bf-tree](https:/
 
 ## Overview
 
-Quickstep is an implementation of a Bf-tree (B-tree with buffer pool optimization), designed as a high-performance, concurrent storage engine. It provides:
+Quickstep is an implementation of a Bf-tree (B-tree with buffer pool optimisation), designed as a high-performance, concurrent storage engine. It provides:
 
 - **Concurrent access** with optimistic locking and fine-grained page-level locks
 - **Variable-size mini-pages** for efficient memory usage and write buffering
@@ -18,13 +18,13 @@ Quickstep is an implementation of a Bf-tree (B-tree with buffer pool optimizatio
 
 ## What is a Bf-tree?
 
-The Bf-tree is a modern read-write-optimized concurrent range index, as described in the [VLDB 2024 paper](https://github.com/XiangpengHao/bf-tree-docs) by Xiangpeng Hao and Badrish Chandramouli. Key innovations include:
+The Bf-tree is a modern read-write-optimised concurrent range index, as described in the [VLDB 2024 paper](https://github.com/XiangpengHao/bf-tree-docs) by Xiangpeng Hao and Badrish Chandramouli. Key innovations include:
 
 - **Mini-pages**: Variable-size pages (64B to 4KB) that serve as both a record-level cache and write buffer
 - **Circular buffer pool**: Efficient memory management with second-chance eviction for LRU approximation
-- **Optimized for modern SSDs**: Designed for parallel random 4KB writes with similar throughput to sequential writes
+- **Optimised for modern SSDs**: Designed for parallel random 4KB writes with similar throughput to sequential writes
 
-For detailed explanations and visualizations, see the [Bf-tree documentation repository](https://github.com/XiangpengHao/bf-tree-docs).
+For detailed explanations and visualisations, see the [Bf-tree documentation repository](https://github.com/XiangpengHao/bf-tree-docs).
 
 ## Architecture
 

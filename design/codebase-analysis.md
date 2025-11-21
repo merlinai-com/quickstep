@@ -9,7 +9,7 @@
 
 ## Executive Summary
 
-Quickstep is an implementation of a modern Bf-tree (B-tree with buffer pool optimization) in Rust, designed as a concurrent embedded key-value store. The codebase is in active development with core architecture in place but many features marked as `todo!()`. The implementation closely follows the design patterns predicted in the design document, with some interesting architectural choices.
+Quickstep is an implementation of a modern Bf-tree (B-tree with buffer pool optimisation) in Rust, designed as a concurrent embedded key-value store. The codebase is in active development with core architecture in place but many features marked as `todo!()`. The implementation closely follows the design patterns predicted in the design document, with some interesting architectural choices.
 
 ---
 
@@ -146,6 +146,7 @@ pub fn commit(self)  // Commit (empty implementation)
 | **Transaction model** | Transaction-based API | ✅ QuickStepTx exists | ✅ |
 | **File I/O** | Direct file operations | ✅ IoEngine present | ✅ |
 
+### 4.2 What Was Different
 ### 4.2 What Was Different
 
 | Aspect | Prediction | Reality | Notes |
