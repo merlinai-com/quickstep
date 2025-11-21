@@ -1,0 +1,6 @@
+Bf-Tree: A Modern Read-Write-Optimized Concurrent Larger-Than-Memory Range Index
+Xiangpeng Hao∗ University of Wisconsin-Madison, xiangpeng.hao@wisc.edu 
+Badrish Chandramouli Microsoft Research, badrishc@microsoft.com
+https://vldb.org/pvldb/vol17/p3442-hao.pdf
+https://dl.acm.org/doi/10.14778/3681954.3682012
+https://github.com/XiangpengHao/bf-tree-docs
