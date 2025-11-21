@@ -1,6 +1,6 @@
 # Quickstep
 
-A modern, concurrent embedded key-value store implementing the [Bf-tree](https://github.com/XiangpengHao/bf-tree-docs) data structure in Rust. The core implementation is led by [Raphael Darley](https://github.com/RaphaelDarley); this repository tracks MerlinAI’s public fork and contributions.
+A modern, concurrent embedded key-value store implementing the [Bf-tree](https://github.com/XiangpengHao/bf-tree-docs) data structure in Rust. The core implementation is led by [Raphael Darley](https://github.com/RaphaelDarley); this repository tracks MerlinAI’s public fork and contributions, with the explicit goal of powering the HelixDB storage layer.
 
 ## Overview
 
@@ -119,6 +119,7 @@ This repository includes comprehensive design documentation:
 
 - [`design/codebase-analysis.md`](design/codebase-analysis.md) - Detailed analysis of the codebase architecture
 - [`design/bf-tree-docs/`](design/bf-tree-docs/) - Reference materials from the Bf-tree paper authors
+- [`design/roadmap.md`](design/roadmap.md) - Phased roadmap and upcoming work
 
 ## Contributing
 
@@ -141,7 +142,7 @@ at your option. See `Cargo.toml` for details.
 
 - **Original Implementation**: This project is based on the work by [Raphael Darley](https://github.com/RaphaelDarley/quickstep)
 - **Bf-tree Research**: Inspired by the research of Xiangpeng Hao and Badrish Chandramouli ([paper](https://github.com/XiangpengHao/bf-tree-docs))
-- **MerlinAI**: This fork is maintained by [MerlinAI](https://github.com/merlinai-com) for integration with our platform
+- **HelixDB / MerlinAI**: This fork is maintained by the small MerlinAI team (with Raphael’s access) specifically to integrate the storage engine into [HelixDB](https://github.com/HelixDB/helix-db)
 
 ## Related Projects
 
