@@ -1,4 +1,5 @@
 use std::{
+    array,
     marker::PhantomData,
     ptr::NonNull,
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
@@ -20,6 +21,7 @@ use crate::{
 ///    +----------------------------------------------------+
 pub struct MiniPageBuffer {
     buffer: NonNull<u64>,
+    backing: Box<[u64]>,
     /// number of words in buffer, must be a power of 2
     buff_size: usize,
     /// u64::MAX represents None
@@ -31,6 +33,41 @@ pub struct MiniPageBuffer {
 }
 
 impl MiniPageBuffer {
+    pub fn new(cache_size_lg: usize) -> MiniPageBuffer {
+        assert!(
+            cache_size_lg >= 3 && cache_size_lg < usize::BITS as usize,
+            "cache_size_lg must be between 3 and {}",
+            usize::BITS - 1
+        );
+
+        let total_bytes = 1usize
+            .checked_shl(cache_size_lg as u32)
+            .expect("cache size overflowed usize");
+        assert!(
+            total_bytes % 8 == 0,
+            "cache size must be aligned to 64-bit words"
+        );
+
+        let buff_size = total_bytes / 8;
+        assert!(
+            buff_size.is_power_of_two(),
+            "cache size must be a power of two"
+        );
+
+        let mut backing = vec![0u64; buff_size].into_boxed_slice();
+        let buffer =
+            NonNull::new(backing.as_mut_ptr()).expect("backing allocation should never be null");
+
+        MiniPageBuffer {
+            buffer,
+            backing,
+            buff_size,
+            free_lists: array::from_fn(|_| AtomicUsize::new(usize::MAX)),
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
     const fn wrap(&self, index: usize) -> usize {
         index & (self.buff_size - 1)
     }

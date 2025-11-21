@@ -65,7 +65,25 @@ pub struct QuickStepConfig {
 
 impl QuickStep {
     pub fn new(config: QuickStepConfig) -> QuickStep {
-        todo!()
+        let QuickStepConfig {
+            path,
+            inner_node_upper_bound,
+            leaf_upper_bound,
+            cache_size_lg,
+        } = config;
+
+        let data_path = resolve_data_path(&path);
+
+        let io_engine =
+            IoEngine::open(&data_path).expect("failed to open quickstep data file for writing");
+        let cache = MiniPageBuffer::new(cache_size_lg);
+
+        QuickStep {
+            inner_nodes: BPTree::new(inner_node_upper_bound),
+            cache,
+            io_engine,
+            map_table: MapTable::new(leaf_upper_bound),
+        }
     }
 
     /// Create a new transaction for isolated operations
@@ -132,6 +150,14 @@ impl<'db> QuickStepTx<'db> {
     pub fn abort(self) {}
 
     pub fn commit(self) {}
+}
+
+fn resolve_data_path(path: &Path) -> PathBuf {
+    if path.is_dir() || path.extension().is_none() {
+        path.join("quickstep.db")
+    } else {
+        path.to_path_buf()
+    }
 }
 
 impl<'db> QuickStepTx<'db> {

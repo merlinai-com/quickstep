@@ -1,4 +1,9 @@
-use std::{fs::File, mem::MaybeUninit, os::unix::fs::FileExt};
+use std::{
+    fs::{self, File, OpenOptions},
+    mem::MaybeUninit,
+    os::unix::fs::FileExt,
+    path::Path,
+};
 
 use crate::{lock_manager::WriteGuardWrapper, types::NodeMeta};
 
@@ -7,6 +12,22 @@ pub struct IoEngine {
 }
 
 impl IoEngine {
+    pub fn open(path: &Path) -> std::io::Result<IoEngine> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+
+        Ok(IoEngine { file })
+    }
+
     /// Get the page of the given address
     pub fn get_page(&self, page_addr: u64) -> DiskLeaf {
         // SAFETY: this immediately overwritten
