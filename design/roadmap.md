@@ -11,7 +11,7 @@
 | Workstream | Status | Notes |
 |------------|--------|-------|
 | Fork & rename repo | ✅ Done | Repo lives at `merlinai-com/quickstep` |
-| Attribution & docs | ✅ Done | README, AUTHORS, design docs reference Raphael Darley |
+| Attribution & docs | ✅ Done | README, AUTHORS, design docs reference Raphael Darley and Hao & Chandramouli |
 | Codebase analysis | ✅ Done | `design/codebase-analysis.md` |
 
 ## Phase 1 – Core Engine Completion (WIP)
