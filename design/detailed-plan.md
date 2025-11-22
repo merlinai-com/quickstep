@@ -150,21 +150,23 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
 **Goal:** decouple crash recovery from stale disk addresses by logging and replaying mutations per logical `PageId`, reinstalling real fence bounds before rehydrating user entries, and documenting any remaining crash-time limitations.
 
 ### 1.4.1 – Format & plumbing updates
-1. Rework `WalRecord` to encode the logical `PageId`, fence bounds, and an opaque payload that explicitly references the survivor leaf (no more physical `disk_addr` coupling). We will keep the current fences in the record so replay can install them deterministically.
-2. Update the serializer/deserializer to write a compact header `{page_id, lower_len, upper_len, payload_len}` followed by the fence blobs and key/value record payload. While here, teach the WAL writer to batch records per page (length-prefixed group) so replay knows exactly when a leaf’s slice ends.
-3. Extend `WalManager` with helpers to stream grouped records: `records_by_page()` returns an iterator of `(PageId, Vec<WalRecord>)`, avoiding the current ad-hoc `Vec` rebuild in `QuickStep::replay_wal`.
-4. Modify `QuickStepTx::append_wal_put/delete` to pass the logical `PageId`, fences, and user payload to the new writer. Disk addresses are still needed for checkpoints, but they no longer appear in non-checkpoint records.
+1. ✅ `WalRecord` now carries only the logical `PageId`, fence blobs, and the key/value payload—no physical `disk_addr`. `QuickStepTx::append_wal_put/delete` capture `[lower, upper]` fences plus the key/value and pass them to the new interface.
+2. ✅ `WalManager` serializes/deserializes the slimmer record header and exposes `records_grouped()` so replay can iterate batches per page without ad-hoc Vec regrouping.
+3. ✅ Per-leaf accounting moved to `PageId` as well: checkpoint thresholds, global-prune candidates, `debug_wal_stats`, and `wal_record_count` in the tests all operate on logical pages now.
+4. ☐ Follow-up: emit explicit length-prefixed “page groups” in the WAL file so readers can skip whole batches without reallocating.
 
 ### 1.4.2 – Replay redesign
-1. During startup, call `records_by_page()` and, for each `PageId`, resolve the latest binding through the map table. If the page is already cached, borrow its `NodeMeta`; otherwise, fetch the disk leaf, promote it into a temporary `DiskLeaf`, and install the logged fences via `reset_user_entries_with_fences`.
-2. Apply the grouped WAL payloads in key-sorted order via `NodeMeta::replay_entries`, so replayed leaves stay within page size limits even if earlier on-disk images were fuller. After every page group is applied, write the leaf back to disk and, if the page is cached, refresh the cache copy.
-3. Teach replay to install fence metadata before user entries, ensuring delete-triggered auto-merges, evictions, and WAL recovery all agree on the survivor’s key range.
-4. Once a page’s WAL group finishes successfully, drop those records from the log (`checkpoint_page`), so the WAL never accumulates stale page bindings again.
+1. ✅ Startup replay now consumes `records_grouped()`, resolves the current `PageId` binding via the map table, and hydrates both the on-disk leaf plus any cached `NodeMeta` with the recorded fences before reapplying user entries.
+2. ✅ Entries within a batch are replayed through the existing `NodeMeta::replay_entries` iterator (which sorts via `BTreeMap`), guaranteeing page-level space accounting. Once a page finishes, we write the page back to disk and refresh the cached copy (if resident).
+3. ✅ Fence metadata is reinstalled first, fixing the merge-crash case where stale sentinel bounds caused prefix compression failures.
+4. ✅ `checkpoint_leaf` → `checkpoint_page`, `should_checkpoint_page`, and `leaf_stats(PageId)` ensure WAL pruning keys off logical IDs. Global checkpoints also use `PageId`, and eviction checkpoints call the new API after flushing dirty leaves.
+5. ☐ Future: once serializer emits explicit page-group frames, we can truncate the WAL incrementally without cloning the full record Vec.
 
 ### 1.4.3 – Testing & docs
-1. Re-enable the merge-crash regression using only public ops (`put`/`delete`/auto-merge). Add a complementary eviction test that drives a WAL replay after evicting one sibling to disk and keeping the other cached.
-2. Extend `tests/quickstep_fence_keys.rs` to assert fence monotonicity after WAL replay plus delete-triggered merges, ensuring fence metadata survives splits, merges, evictions, and crashes.
-3. Document the new replay pipeline and any remaining crash constraints in `README.md` + this plan. Call out that WAL recovery now trusts logical `PageId`s rather than physical disk addresses, eliminating the `InsufficientSpace` failures we saw when reapplying stale layouts.
+1. ✅ `tests/quickstep_delete_persist.rs::wal_replay_survives_merge_crash` now uses only public operations (split via inserts, deletes that trigger auto-merge) and passes under the new replay logic. It previously panicked with stale `disk_addr` writes; now it exercises the PageId path end-to-end.
+2. ✅ `wal_records_include_fence_bounds` updated to cover the new record format and continues to assert fence blob round-trips.
+3. ☐ Expand `tests/quickstep_fence_keys.rs`/new eviction tests to validate fence monotonicity immediately after WAL replay when some leaves stay cached. (Tracked in TODO.)
+4. ✅ README + roadmap mention the PageId-based WAL plan; this document records the completed sub-tasks above.
 
 ### 1.4.4 – Rollout
 1. Land the format + replay changes behind a feature branch, run the full `quickstep_delete_persist` suite, and explicitly record the before/after behaviour in `CODING_HISTORY.md`.

@@ -243,7 +243,7 @@ impl MiniPageBuffer {
             flush_dirty_entries(meta, io_engine);
 
             let disk_addr = meta.leaf();
-            wal.checkpoint_leaf(disk_addr)
+            wal.checkpoint_page(page_id)
                 .expect("failed to checkpoint WAL during eviction");
             guard.set_leaf(disk_addr);
             meta.set_live(false);

@@ -6,6 +6,16 @@
 
 # Changelog
 
+#### 2025-11-22 19:45 UTC [pending] [main]
+
+##### Phase 1.4 PageId WAL logging + replay
+
+- `WalRecord` now stores only logical `PageId`s plus fence blobs and key/value payloads; `WalManager` serializes/deserializes the slimmer records, exposes `records_grouped()`, and all per-leaf stats/pruning helpers operate on `PageId`.
+- `QuickStepTx::append_wal_put`/`delete` capture each leaf’s fences, log via the new API, and call `checkpoint_page(PageId)` once thresholds are exceeded; eviction and manual flush paths now reference the logical page as well.
+- Startup replay batches the grouped records per page, reinstalls the recorded fences, replays entries through `NodeMeta::replay_entries`, refreshes any cached mini-page copy, and writes the survivor leaf back to disk; `wal_replay_survives_merge_crash` now passes using only public operations.
+- The map table backing store is zero-initialised to avoid bogus `NodeRef::MiniPage` pointers during replay, and `MapTable::has_entry` lets replay skip unused slots safely.
+- Docs: updated `design/detailed-plan.md` (Section 1.4), README status table, roadmap, and coding history to reflect the PageId-based WAL work and the restored regression tests.
+
 #### 2025-11-22 18:50 UTC [pending] [main]
 
 ##### Phase 1.4 WAL replay hardening plan

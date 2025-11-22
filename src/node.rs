@@ -484,13 +484,11 @@ impl NodeMeta {
 
         self.set_record_count(2);
 
-        let mut lower_meta =
-            KVMeta::new(lower.len(), 0, 0, KVRecordType::Cache, true, true, 0);
+        let mut lower_meta = KVMeta::new(lower.len(), 0, 0, KVRecordType::Cache, true, true, 0);
         let _ = lower_meta.set_offset(lower_offset);
         self.set_kv_meta(0, lower_meta);
 
-        let mut upper_meta =
-            KVMeta::new(upper.len(), 0, 0, KVRecordType::Cache, true, true, 0);
+        let mut upper_meta = KVMeta::new(upper.len(), 0, 0, KVRecordType::Cache, true, true, 0);
         let _ = upper_meta.set_offset(upper_offset);
         self.set_kv_meta(1, upper_meta);
     }

@@ -1,5 +1,5 @@
 use std::{
-    alloc::{alloc, Layout},
+    alloc::{alloc_zeroed, Layout},
     f64::consts::E,
     iter::Map,
     marker::PhantomData,
@@ -24,7 +24,7 @@ impl MapTable {
     pub fn new(leaf_upper_bound: u64) -> MapTable {
         let layout = Layout::array::<u64>(leaf_upper_bound as usize).expect("todo");
 
-        let ptr = unsafe { alloc(layout) };
+        let ptr = unsafe { alloc_zeroed(layout) };
 
         let arr = match NonNull::new(ptr as *mut AtomicU64) {
             Some(p) => p,
@@ -54,6 +54,10 @@ impl MapTable {
         self.next_free.store(1, Ordering::Release);
 
         PageId(0)
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.cap
     }
 
     pub fn create_page_entry(&self, node: MiniPageIndex) -> PageWriteGuard<'_> {
@@ -119,6 +123,14 @@ impl MapTable {
         }
 
         Err(QSError::PageLockFail)
+    }
+
+    pub fn has_entry(&self, page: PageId) -> bool {
+        if page.0 as usize >= self.cap {
+            return false;
+        }
+        let entry_ref = self.get_ref(page);
+        entry_ref.load(Ordering::Acquire) != 0
     }
 
     // TODO: refactor to take read lock and upgrade

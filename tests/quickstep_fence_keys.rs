@@ -29,7 +29,11 @@ fn drive_root_split(db: &QuickStep) -> (Vec<PageId>, Vec<u8>, usize) {
     let parent = db
         .debug_root_leaf_parent()
         .expect("root should have promoted to an inner node");
-    assert_eq!(parent.children.len(), 2, "expected two children after split");
+    assert_eq!(
+        parent.children.len(),
+        2,
+        "expected two children after split"
+    );
     (parent.children, parent.pivots[0].clone(), inserted)
 }
 
@@ -100,7 +104,11 @@ fn split_children_receive_parent_bounds() {
     let (children, pivot, _) = drive_root_split(&db);
 
     let left = db.debug_leaf_fences(children[0]).expect("left fences");
-    assert_eq!(left.lower, vec![0x00], "left child lower fence should be -inf");
+    assert_eq!(
+        left.lower,
+        vec![0x00],
+        "left child lower fence should be -inf"
+    );
     assert_eq!(
         left.upper, pivot,
         "left child upper fence should equal pivot"
@@ -108,7 +116,11 @@ fn split_children_receive_parent_bounds() {
     assert_bounds_cover_keys(&db, children[0]);
 
     let right = db.debug_leaf_fences(children[1]).expect("right fences");
-    assert_eq!(right.upper, vec![0xFF], "right child upper fence should be +inf");
+    assert_eq!(
+        right.upper,
+        vec![0xFF],
+        "right child upper fence should be +inf"
+    );
     assert_eq!(
         right.lower, pivot,
         "right child lower fence should equal pivot"
@@ -207,4 +219,3 @@ fn delete_auto_merge_preserves_fence_monotonicity() {
         assert_bounds_cover_keys(&db, PageId::from_u64(0));
     }
 }
-

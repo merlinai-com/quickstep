@@ -2,11 +2,14 @@
 
 # Coding History
 
-#### 2025-11-22 18:50 UTC [pending] [main]
+#### 2025-11-22 19:45 UTC [pending] [main]
 
-- Documented Phase 1.4 in `design/detailed-plan.md`: WAL records will switch to logical `PageId`s, serialize fence blobs + grouped mutations per leaf, and replay will hydrate each page via the current map-table binding before writing back to disk. The section also tracks the required serializer/deserializer changes, replay ordering, regression tests, and documentation tasks.
-- Updated README’s status table to highlight that WAL crash recovery remains partially implemented until the PageId-based redesign ships, giving contributors/users a clear pointer to the plan.
-- Noted in the changelog that the plan/README were refreshed so the next commit can reference an agreed blueprint for the WAL hardening work.
+- Reworked WAL logging/replay to operate on logical `PageId`s only: `WalRecord` dropped `disk_addr`, writer/reader now batch records per page (`records_grouped()`), checkpoints/key stats accept `PageId`, and `QuickStepTx::append_wal_put/delete` log fences + payloads via the new API before calling `checkpoint_page`.
+- Replay resolves the current map-table binding for each `PageId`, reinstalls the recorded fences, replays entries into both the disk leaf and any cached mini-page, and writes the survivor back; `wal_replay_survives_merge_crash` no longer needs debug helpers and passes solely via public operations.
+- Map table memory is zeroed up front and `MapTable::has_entry` prevents replay from touching uninitialised slots; `debug_wal_stats`/tests were updated accordingly.
+- Docs: detailed-plan Section 1.4 now records the completed sub-tasks, README status bullets highlight the PageId-based WAL progress, and the changelog summarizes the new behaviour.
+
+#### 2025-11-22 18:50 UTC [pending] [main]
 
 #### 2025-11-22 17:39 UTC [pending] [main]
 

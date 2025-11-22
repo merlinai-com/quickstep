@@ -1,14 +1,8 @@
-use quickstep::{
-    debug,
-    map_table::PageId,
-    wal::WalManager,
-    QuickStep,
-    QuickStepConfig,
-};
+use quickstep::{debug, map_table::PageId, wal::WalManager, QuickStep, QuickStepConfig};
 use tempfile::TempDir;
 
-fn wal_record_count(db: &QuickStep, disk_addr: Option<u64>) -> usize {
-    db.debug_wal_stats(disk_addr).leaf_records.unwrap_or(0)
+fn wal_record_count(db: &QuickStep, page_id: Option<PageId>) -> usize {
+    db.debug_wal_stats(page_id).leaf_records.unwrap_or(0)
 }
 
 #[test]
@@ -17,16 +11,9 @@ fn wal_records_include_fence_bounds() {
     let wal_path = temp.path().join("quickstep.wal");
     {
         let wal = WalManager::open(&wal_path).expect("open wal");
-        wal.append_put(
-            PageId::from_u64(7),
-            128,
-            b"key-0001",
-            b"value",
-            &[0x00],
-            &[0x7F],
-        )
-        .expect("append put");
-        wal.append_tombstone(PageId::from_u64(7), 128, b"key-0002", &[0x10], &[0x80])
+        wal.append_put(PageId::from_u64(7), b"key-0001", b"value", &[0x00], &[0x7F])
+            .expect("append put");
+        wal.append_tombstone(PageId::from_u64(7), b"key-0002", &[0x10], &[0x80])
             .expect("append tombstone");
     }
 
@@ -46,8 +33,11 @@ fn wal_replay_survives_merge_crash() {
     let pivot_key: Vec<u8>;
     {
         debug::reset_debug_counters();
-        let cfg = QuickStepConfig::new(db_path.clone(), 32, 256, 14)
-            .with_wal_thresholds(usize::MAX, usize::MAX, usize::MAX);
+        let cfg = QuickStepConfig::new(db_path.clone(), 32, 256, 14).with_wal_thresholds(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        );
         let db = QuickStep::new(cfg);
         let payload = vec![0u8; 64];
         const TOTAL_KEYS: usize = 96;
@@ -97,8 +87,11 @@ fn wal_replay_survives_merge_crash() {
     }
 
     let reopened = QuickStep::new(
-        QuickStepConfig::new(db_path, 32, 256, 14)
-            .with_wal_thresholds(usize::MAX, usize::MAX, usize::MAX),
+        QuickStepConfig::new(db_path, 32, 256, 14).with_wal_thresholds(
+            usize::MAX,
+            usize::MAX,
+            usize::MAX,
+        ),
     );
     let snapshot = reopened
         .debug_leaf_snapshot(PageId::from_u64(0))
@@ -227,7 +220,7 @@ fn wal_auto_checkpoint_trims_entries() {
         tx.commit();
     }
     assert!(
-        wal_record_count(&db, Some(0)) < 8,
+        wal_record_count(&db, Some(PageId::from_u64(0))) < 8,
         "auto checkpoint should prune per-leaf WAL entries"
     );
 }
@@ -246,7 +239,7 @@ fn wal_byte_threshold_triggers_checkpoint() {
         }
         tx.commit();
         assert!(
-            wal_record_count(&db, Some(0)) < 4,
+            wal_record_count(&db, Some(PageId::from_u64(0))) < 4,
             "byte-based threshold should trigger global checkpoint"
         );
     }
@@ -272,7 +265,7 @@ fn wal_respects_custom_thresholds() {
         tx.commit();
     }
     assert!(
-        wal_record_count(&db, Some(0)) >= 48,
+        wal_record_count(&db, Some(PageId::from_u64(0))) >= 48,
         "custom thresholds should delay automatic pruning"
     );
 }

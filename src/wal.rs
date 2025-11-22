@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},
     path::Path,
@@ -14,7 +14,6 @@ const RECORD_TYPE_TOMBSTONE: u8 = 1;
 #[derive(Clone, Debug)]
 pub struct WalRecord {
     pub page_id: u64,
-    pub disk_addr: u64,
     pub key: Vec<u8>,
     pub lower_fence: Vec<u8>,
     pub upper_fence: Vec<u8>,
@@ -28,7 +27,6 @@ pub enum WalOp {
 }
 
 struct LeafWalStats {
-    page_id: u64,
     count: usize,
     bytes: usize,
 }
@@ -68,12 +66,9 @@ impl WalManager {
         let mut leaf_counts = HashMap::new();
         let mut total_bytes = 0usize;
         for record in records.iter() {
-            let entry = leaf_counts.entry(record.disk_addr).or_insert(LeafWalStats {
-                page_id: record.page_id,
-                count: 0,
-                bytes: 0,
-            });
-            entry.page_id = record.page_id;
+            let entry = leaf_counts
+                .entry(record.page_id)
+                .or_insert(LeafWalStats { count: 0, bytes: 0 });
             entry.count += 1;
             let size = record_size(record);
             entry.bytes = entry.bytes.saturating_add(size);
@@ -97,17 +92,27 @@ impl WalManager {
         state.records.clone()
     }
 
+    pub fn records_grouped(&self) -> BTreeMap<u64, Vec<WalRecord>> {
+        let state = self.state.lock().expect("wal mutex poisoned");
+        let mut grouped: BTreeMap<u64, Vec<WalRecord>> = BTreeMap::new();
+        for record in state.records.iter() {
+            grouped
+                .entry(record.page_id)
+                .or_default()
+                .push(record.clone());
+        }
+        grouped
+    }
+
     pub fn append_tombstone(
         &self,
         page_id: PageId,
-        disk_addr: u64,
         key: &[u8],
         lower_fence: &[u8],
         upper_fence: &[u8],
     ) -> io::Result<()> {
         self.append_record(WalRecord {
             page_id: page_id.as_u64(),
-            disk_addr,
             key: key.to_vec(),
             lower_fence: lower_fence.to_vec(),
             upper_fence: upper_fence.to_vec(),
@@ -118,7 +123,6 @@ impl WalManager {
     pub fn append_put(
         &self,
         page_id: PageId,
-        disk_addr: u64,
         key: &[u8],
         value: &[u8],
         lower_fence: &[u8],
@@ -126,7 +130,6 @@ impl WalManager {
     ) -> io::Result<()> {
         self.append_record(WalRecord {
             page_id: page_id.as_u64(),
-            disk_addr,
             key: key.to_vec(),
             lower_fence: lower_fence.to_vec(),
             upper_fence: upper_fence.to_vec(),
@@ -147,13 +150,8 @@ impl WalManager {
             .expect("wal byte counter overflow");
         let entry = state
             .leaf_counts
-            .entry(record.disk_addr)
-            .or_insert(LeafWalStats {
-                page_id: record.page_id,
-                count: 0,
-                bytes: 0,
-            });
-        entry.page_id = record.page_id;
+            .entry(record.page_id)
+            .or_insert(LeafWalStats { count: 0, bytes: 0 });
         entry.count += 1;
         entry.bytes = entry.bytes.saturating_add(record_len);
         write_record(&mut state.file, &record)?;
@@ -161,17 +159,18 @@ impl WalManager {
         Ok(())
     }
 
-    pub fn checkpoint_leaf(&self, disk_addr: u64) -> io::Result<()> {
+    pub fn checkpoint_page(&self, page_id: PageId) -> io::Result<()> {
+        let page_key = page_id.as_u64();
         let mut state = self.state.lock().expect("wal mutex poisoned");
         if state
             .records
             .iter()
-            .all(|record| record.disk_addr != disk_addr)
+            .all(|record| record.page_id != page_key)
         {
             return Ok(());
         }
-        let removed = state.leaf_counts.remove(&disk_addr);
-        state.records.retain(|record| record.disk_addr != disk_addr);
+        let removed = state.leaf_counts.remove(&page_key);
+        state.records.retain(|record| record.page_id != page_key);
         if let Some(stats) = removed {
             state.total_records = state.total_records.saturating_sub(stats.count);
             state.total_bytes = state.total_bytes.saturating_sub(stats.bytes);
@@ -193,11 +192,11 @@ impl WalManager {
         Ok(())
     }
 
-    pub fn should_checkpoint(&self, disk_addr: u64, threshold: usize) -> bool {
+    pub fn should_checkpoint_page(&self, page_id: PageId, threshold: usize) -> bool {
         let state = self.state.lock().expect("wal mutex poisoned");
         state
             .leaf_counts
-            .get(&disk_addr)
+            .get(&page_id.as_u64())
             .map(|stats| stats.count >= threshold)
             .unwrap_or(false)
     }
@@ -212,19 +211,19 @@ impl WalManager {
         state.total_bytes
     }
 
-    pub fn leaf_stats(&self, disk_addr: u64) -> Option<(u64, usize, usize)> {
+    pub fn leaf_stats(&self, page_id: PageId) -> Option<(usize, usize)> {
         let state = self.state.lock().expect("wal mutex poisoned");
         state
             .leaf_counts
-            .get(&disk_addr)
-            .map(|stats| (stats.page_id, stats.count, stats.bytes))
+            .get(&page_id.as_u64())
+            .map(|stats| (stats.count, stats.bytes))
     }
 
     pub fn global_checkpoint_candidate(
         &self,
         total_record_threshold: usize,
         total_byte_threshold: usize,
-    ) -> Option<(u64, PageId)> {
+    ) -> Option<PageId> {
         let state = self.state.lock().expect("wal mutex poisoned");
         if state.total_records < total_record_threshold && state.total_bytes < total_byte_threshold
         {
@@ -234,7 +233,7 @@ impl WalManager {
             .leaf_counts
             .iter()
             .max_by_key(|(_, stats)| stats.bytes)
-            .map(|(disk, stats)| (*disk, PageId(stats.page_id)))
+            .map(|(page, _)| PageId(*page))
     }
 }
 
@@ -253,7 +252,6 @@ fn write_record(file: &mut File, record: &WalRecord) -> io::Result<()> {
         WalOp::Put { value } => {
             file.write_all(&[RECORD_TYPE_PUT])?;
             file.write_all(&record.page_id.to_le_bytes())?;
-            file.write_all(&record.disk_addr.to_le_bytes())?;
             let key_len = record.key.len() as u32;
             let val_len = value.len() as u32;
             let lower_len = record.lower_fence.len() as u32;
@@ -270,7 +268,6 @@ fn write_record(file: &mut File, record: &WalRecord) -> io::Result<()> {
         WalOp::Tombstone => {
             file.write_all(&[RECORD_TYPE_TOMBSTONE])?;
             file.write_all(&record.page_id.to_le_bytes())?;
-            file.write_all(&record.disk_addr.to_le_bytes())?;
             let key_len = record.key.len() as u32;
             let lower_len = record.lower_fence.len() as u32;
             let upper_len = record.upper_fence.len() as u32;
@@ -293,14 +290,12 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, Option<u64>)> {
     let mut records = Vec::new();
     while idx < bytes.len() {
         let record_start = idx;
-        if bytes.len() - idx < 1 + 8 + 8 + 4 {
+        if bytes.len() - idx < 1 + 8 + 4 {
             break;
         }
         let record_type = bytes[idx];
         idx += 1;
         let page_id = u64::from_le_bytes(bytes[idx..idx + 8].try_into().unwrap());
-        idx += 8;
-        let disk_addr = u64::from_le_bytes(bytes[idx..idx + 8].try_into().unwrap());
         idx += 8;
         match record_type {
             RECORD_TYPE_TOMBSTONE => {
@@ -328,7 +323,6 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, Option<u64>)> {
                 idx += upper_len;
                 records.push(WalRecord {
                     page_id,
-                    disk_addr,
                     key,
                     lower_fence: lower,
                     upper_fence: upper,
@@ -364,7 +358,6 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, Option<u64>)> {
                 idx += upper_len;
                 records.push(WalRecord {
                     page_id,
-                    disk_addr,
                     key,
                     lower_fence: lower,
                     upper_fence: upper,
@@ -388,9 +381,7 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, Option<u64>)> {
 fn record_size(record: &WalRecord) -> usize {
     match &record.op {
         WalOp::Put { value } => {
-            1
-                + 8
-                + 8
+            1 + 8
                 + 4
                 + 4
                 + 4
@@ -401,9 +392,7 @@ fn record_size(record: &WalRecord) -> usize {
                 + record.upper_fence.len()
         }
         WalOp::Tombstone => {
-            1
-                + 8
-                + 8
+            1 + 8
                 + 4
                 + 4
                 + 4
