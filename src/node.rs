@@ -4,11 +4,87 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use crate::types::{KVMeta, KVRecordType, NodeMeta};
+use crate::{
+    map_table::PageId,
+    types::{KVMeta, KVRecordType, NodeMeta, NodeSize},
+};
 
 // TODO: need to read node meta atomically
 
 impl NodeMeta {
+    /// Drop all non-fence entries while keeping the existing fence keys.
+    /// After calling this, the node only contains its lower and upper fence,
+    /// so callers can replay a new set of user records using the normal insert path.
+    pub fn reset_user_entries(&mut self) {
+        if self.record_count() <= 2 {
+            return;
+        }
+
+        let lower_fence = self.get_kv_meta(0);
+        let upper_fence = self.get_kv_meta(self.record_count() as usize - 1);
+
+        self.set_kv_meta(0, lower_fence);
+        self.set_kv_meta(1, upper_fence);
+        self.set_record_count(2);
+    }
+
+    pub fn ensure_fence_keys(&mut self) {
+        if self.record_count() >= 2 {
+            return;
+        }
+
+        let mut cursor = self.size().size_in_bytes();
+        let base_ptr = self.get_base_ptr() as *mut u8;
+
+        const LOWER_FENCE: [u8; 1] = [0x00];
+        const UPPER_FENCE: [u8; 1] = [0xFF];
+
+        unsafe {
+            self.set_record_count(2);
+
+            cursor -= UPPER_FENCE.len();
+            base_ptr
+                .add(cursor)
+                .copy_from_nonoverlapping(UPPER_FENCE.as_ptr(), UPPER_FENCE.len());
+            let upper_offset = cursor as usize;
+
+            cursor -= LOWER_FENCE.len();
+            base_ptr
+                .add(cursor)
+                .copy_from_nonoverlapping(LOWER_FENCE.as_ptr(), LOWER_FENCE.len());
+            let lower_offset = cursor as usize;
+
+            let mut lower_meta =
+                KVMeta::new(LOWER_FENCE.len(), 0, 0, KVRecordType::Cache, true, true, 0);
+            let _ = lower_meta.set_offset(lower_offset as u16);
+            self.set_kv_meta(0, lower_meta);
+
+            let mut upper_meta =
+                KVMeta::new(UPPER_FENCE.len(), 0, 0, KVRecordType::Cache, true, true, 0);
+            let _ = upper_meta.set_offset(upper_offset as u16);
+            self.set_kv_meta(1, upper_meta);
+        }
+
+        debug_assert!(self.record_count() >= 2, "failed to install fence keys");
+    }
+
+    pub fn format_leaf(&mut self, page_id: PageId, size: NodeSize, disk_addr: u64) {
+        self.reset_header(page_id, size, disk_addr);
+        self.ensure_fence_keys();
+    }
+
+    /// Reinsert the provided entries (full user keys) using the existing try_put
+    /// logic so that prefix compression and bookkeeping remain consistent.
+    pub fn replay_entries<'a, I>(&mut self, entries: I) -> Result<(), InsufficientSpace>
+    where
+        I: IntoIterator<Item = (&'a [u8], &'a [u8])>,
+    {
+        for (key, value) in entries {
+            self.try_put(key, value)?;
+        }
+        Ok(())
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
         let prefix = self.get_node_prefix();
         debug_assert!(key.starts_with(prefix));
@@ -27,6 +103,10 @@ impl NodeMeta {
 
     // TODO: refactor with suffix implementation
     pub fn try_put(&mut self, key: &[u8], val: &[u8]) -> Result<(), InsufficientSpace> {
+        debug_assert!(
+            self.record_count() >= 2,
+            "node missing fence keys before try_put"
+        );
         let node_prefix = self.get_node_prefix();
         let node_prefix_len = node_prefix.len();
         let key_suffix = &key[node_prefix_len..];
@@ -66,9 +146,9 @@ impl NodeMeta {
                         }
 
                         // update metadata
-                        target_kv.set_offset(new_offset as u16);
-                        target_kv.set_val_size(val.iter().len() as u16);
-                        target_kv.set_ref_bit(true);
+                        let _ = target_kv.set_offset(new_offset as u16);
+                        let _ = target_kv.set_val_size(val.iter().len() as u16);
+                        target_kv = target_kv.set_ref_bit(true);
                         self.set_kv_meta(idx, target_kv);
 
                         self.get_key_mut_from_meta(target_kv)
@@ -91,8 +171,10 @@ impl NodeMeta {
                     return Err(InsufficientSpace);
                 }
 
-                let from_ptr = self.get_kv_meta_ref(idx) as *const AtomicU64;
-                let to_ptr = self.get_kv_meta_ref(idx + 1) as *const AtomicU64 as *mut AtomicU64;
+                debug_assert!(idx <= self.record_count() as usize);
+                let kv_meta_start = unsafe { (self as *const NodeMeta).add(1) as *const AtomicU64 };
+                let from_ptr = unsafe { kv_meta_start.add(idx) };
+                let to_ptr = unsafe { kv_meta_start.add(idx + 1) as *mut AtomicU64 };
                 // TODO: check for off by 1
                 // TODO: switch to atomic loop, to account for evicting threads that will come and clear ref bits
                 // Though this is unlikely as copy-on-access should make it unlikely that this will be in second chance region
@@ -111,6 +193,7 @@ impl NodeMeta {
                 );
 
                 self.set_kv_meta(idx, new_meta);
+                self.inc_record_count();
 
                 self.get_key_mut_from_meta(new_meta)
                     .copy_from_slice(key_suffix);
@@ -186,25 +269,32 @@ impl NodeMeta {
     pub fn binary_search(&self, key_suffix: &[u8]) -> Result<usize, usize> {
         let target_lookahead = get_lookahead(key_suffix);
 
-        // The left and right most leafs will be missing a fence key
-        let mut lower = match self.get_kv_meta(0).fence() {
-            true => 1,
-            false => 0,
-        };
-        let mut upper = match self.get_kv_meta(self.record_count() as usize - 1).fence() {
-            true => self.record_count() as usize - 1,
-            false => self.record_count() as usize,
-        };
-        while upper > lower {
-            let mid = lower.midpoint(upper);
+        if self.record_count() <= 2 {
+            return Err(1);
+        }
+
+        let mut lower = if self.get_kv_meta(0).fence() { 1 } else { 0 };
+        let mut upper = self.record_count() as usize - 1;
+        if self.get_kv_meta(upper).fence() {
+            upper = upper.saturating_sub(1);
+        }
+
+        if lower > upper {
+            return Err(lower);
+        }
+
+        while lower <= upper {
+            let mid = lower + ((upper - lower) / 2);
             let mid_kv = self.get_kv_meta(mid);
 
             let mid_lookahead = mid_kv.look_ahead();
 
             match target_lookahead.cmp(&mid_lookahead) {
                 std::cmp::Ordering::Less => {
-                    //target is less than mid, so mid is a new upper bound
-                    upper = mid - 1
+                    if mid == 0 {
+                        break;
+                    }
+                    upper = mid - 1;
                 }
                 std::cmp::Ordering::Equal => {
                     // lookahead is not enough
@@ -212,14 +302,19 @@ impl NodeMeta {
                     let mid_key_suffix = self.get_stored_key_from_meta(mid_kv);
 
                     match key_suffix.cmp(mid_key_suffix) {
-                        std::cmp::Ordering::Less => upper = mid - 1,
+                        std::cmp::Ordering::Less => {
+                            if mid == 0 {
+                                break;
+                            }
+                            upper = mid - 1;
+                        }
                         std::cmp::Ordering::Equal => return Ok(mid),
                         std::cmp::Ordering::Greater => lower = mid + 1,
                     }
                 }
                 std::cmp::Ordering::Greater => {
                     // target is greater than mid, so mid is a lower bound
-                    lower = mid + 1
+                    lower = mid + 1;
                 }
             }
         }
@@ -241,7 +336,8 @@ impl NodeMeta {
             if cur_offset < target_offset {
                 min_offset = min_offset.min(cur_offset);
                 let new_offset = cur_offset + len;
-                kv.set_offset(new_offset as u16);
+                let _ = kv.set_offset(new_offset as u16);
+                let _ = kv.set_offset(new_offset as u16);
                 self.set_kv_meta(i, kv);
             }
         }
@@ -327,3 +423,24 @@ fn get_lookahead(key_suffix: &[u8]) -> u16 {
 
 #[derive(Debug)]
 pub struct InsufficientSpace;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn node_try_put_roundtrip() {
+        let mut buf = vec![0u8; NodeSize::LeafPage.size_in_bytes()];
+        let meta = unsafe { &mut *(buf.as_mut_ptr() as *mut NodeMeta) };
+        meta.format_leaf(PageId(0), NodeSize::LeafPage, 0);
+
+        meta.try_put(b"alpha", b"one").expect("insert alpha");
+        meta.try_put(b"beta", b"two").expect("insert beta");
+        meta.try_put(b"gamma", b"three").expect("insert gamma");
+
+        assert_eq!(meta.get(b"alpha"), Some(b"one".as_ref()));
+        assert_eq!(meta.get(b"beta"), Some(b"two".as_ref()));
+        assert_eq!(meta.get(b"gamma"), Some(b"three".as_ref()));
+        assert_eq!(meta.get(b"delta"), None);
+    }
+}

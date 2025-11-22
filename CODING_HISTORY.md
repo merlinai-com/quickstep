@@ -2,6 +2,13 @@
 
 # Coding History
 
+#### 2025-11-22 10:45 UTC [pending] [main]
+
+- Formatted the on-disk root leaf during `QuickStep::new()` so page 0 always contains the sentinel fence keys before any transaction runs; promotion now copies the disk image verbatim into a mini-page and simply re-points the map-table entry.
+- Tightened `NodeMeta::try_put` to bump record counts when inserting new user entries, fixed the metadata shift logic, and reworked `binary_search` to exclude fence keys—plus added a unit test (`node::tests::node_try_put_roundtrip`) to lock in the behaviour.
+- Updated `design/roadmap.md` with a progress column per phase and noted the resolved bootstrap decisions in `design/detailed-plan.md`.
+- Tests: `cargo test node::tests::node_try_put_roundtrip` and `cargo test insert_and_read_back` (PASS, legacy warnings remain in unfinished modules).
+
 #### 2025-11-21 22:54 UTC [pending] [main]
 
 - Implemented Option A for Phase 1.2: `PageGuard::try_put` now returns a `TryPutResult`, `QuickStepTx::put` loops via `try_put_with_promotion`, and `promote_leaf_to_mini_page` copies disk leaves into the cache while re-pointing the existing map-table entry with `PageWriteGuard::set_mini_page`.

@@ -3,15 +3,15 @@ use crate::error::QSError;
 use crate::io_engine::{DiskLeaf, IoEngine};
 use crate::lock_manager::{GuardWrapper, PageGuard, WriteGuardWrapper};
 use crate::node::InsufficientSpace;
-use crate::types::{NodeMeta, NodeRef, NodeSize};
+use crate::types::{LeafEntry, NodeMeta, NodeRef, NodeSize};
 
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct LeafSplitPlan {
     pub prefix: Vec<u8>,
     pub pivot_key: Vec<u8>,
-    pub retain_count: usize,
-    pub move_entries: Vec<LeafEntryOwned>,
+    pub left_entries: Vec<LeafEntryOwned>,
+    pub right_entries: Vec<LeafEntryOwned>,
 }
 
 #[allow(dead_code)]
@@ -19,6 +19,18 @@ pub struct LeafSplitPlan {
 pub struct LeafEntryOwned {
     pub key: Vec<u8>,
     pub value: Vec<u8>,
+}
+
+impl LeafEntryOwned {
+    fn from_entry(prefix: &[u8], entry: &LeafEntry<'_>) -> LeafEntryOwned {
+        let mut key = Vec::with_capacity(prefix.len() + entry.key_suffix.len());
+        key.extend_from_slice(prefix);
+        key.extend_from_slice(entry.key_suffix);
+        LeafEntryOwned {
+            key,
+            value: entry.value.to_vec(),
+        }
+    }
 }
 
 #[allow(dead_code)]
@@ -49,26 +61,57 @@ impl LeafSplitPlan {
         pivot_key.extend_from_slice(prefix);
         pivot_key.extend_from_slice(pivot_entry.key_suffix);
 
-        let move_entries = live_entries[move_start..]
+        let left_entries = live_entries[..move_start]
             .iter()
-            .map(|entry| {
-                let mut key = Vec::with_capacity(prefix.len() + entry.key_suffix.len());
-                key.extend_from_slice(prefix);
-                key.extend_from_slice(entry.key_suffix);
-                LeafEntryOwned {
-                    key,
-                    value: entry.value.to_vec(),
-                }
-            })
+            .map(|entry| LeafEntryOwned::from_entry(prefix, entry))
+            .collect();
+
+        let right_entries = live_entries[move_start..]
+            .iter()
+            .map(|entry| LeafEntryOwned::from_entry(prefix, entry))
             .collect();
 
         LeafSplitPlan {
             prefix: prefix_buf,
             pivot_key,
-            retain_count: move_start,
-            move_entries,
+            left_entries,
+            right_entries,
         }
     }
+
+    pub fn apply(
+        &self,
+        left: &mut NodeMeta,
+        right: &mut NodeMeta,
+    ) -> Result<LeafSplitOutcome, InsufficientSpace> {
+        left.reset_user_entries();
+        left.replay_entries(
+            self.left_entries
+                .iter()
+                .map(|entry| (entry.key.as_slice(), entry.value.as_slice())),
+        )?;
+
+        right.reset_user_entries();
+        right.replay_entries(
+            self.right_entries
+                .iter()
+                .map(|entry| (entry.key.as_slice(), entry.value.as_slice())),
+        )?;
+
+        Ok(LeafSplitOutcome {
+            pivot_key: self.pivot_key.clone(),
+            left_count: self.left_entries.len(),
+            right_count: self.right_entries.len(),
+        })
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct LeafSplitOutcome {
+    pub pivot_key: Vec<u8>,
+    pub left_count: usize,
+    pub right_count: usize,
 }
 
 impl<'a> PageGuard<'a> {
@@ -142,7 +185,7 @@ impl<'a> PageGuard<'a> {
     }
 }
 
-impl<'tx, 'a> WriteGuardWrapper<'tx, 'a> {
+impl<'a> WriteGuardWrapper<'a> {
     pub fn try_put(&mut self, cache: &MiniPageBuffer, key: &[u8], val: &[u8]) -> TryPutResult {
         let write_guard = self.get_write_guard();
 

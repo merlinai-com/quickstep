@@ -6,7 +6,7 @@ use std::{
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::{lock_manager::WriteGuardWrapper, types::NodeMeta};
+use crate::types::NodeMeta;
 
 pub struct IoEngine {
     file: File,
@@ -29,14 +29,17 @@ impl IoEngine {
 
         // Ensure at least metadata page + first data page exist
         let min_len = 2 * 4096;
-        let current_len = file.metadata()?.len();
+        let mut current_len = file.metadata()?.len();
         if current_len < min_len {
             file.set_len(min_len as u64)?;
+            current_len = min_len as u64;
         }
+
+        let next_addr = (current_len / 4096).saturating_sub(1);
 
         Ok(IoEngine {
             file,
-            next_addr: AtomicU64::new(0),
+            next_addr: AtomicU64::new(next_addr),
         })
     }
 
@@ -75,6 +78,12 @@ pub struct DiskLeaf {
 }
 
 impl DiskLeaf {
+    pub fn zeroed() -> DiskLeaf {
+        DiskLeaf {
+            inner: Box::new([0u8; 4096]),
+        }
+    }
+
     pub fn as_ref(&self) -> &NodeMeta {
         unsafe { &*(self.inner.as_ptr() as *const NodeMeta) }
     }

@@ -12,14 +12,13 @@ use std::{
 };
 
 use crate::{
-    btree::{BPRestart, BPRootInfo, BPTree, OpType},
+    btree::{BPTree, OpType},
     buffer::{MiniPageBuffer, MiniPageIndex},
     error::QSError,
     io_engine::IoEngine,
-    lock_manager::{LockManager, PageGuard, WriteGuardWrapper},
-    map_table::{MapTable, PageReadGuard},
-    node::InsufficientSpace,
-    page_op::{LeafSplitPlan, TryPutResult},
+    lock_manager::{LockManager, WriteGuardWrapper},
+    map_table::{MapTable, PageId},
+    page_op::{LeafSplitOutcome, LeafSplitPlan, TryPutResult},
     types::{NodeMeta, NodeRef, NodeSize},
 };
 
@@ -105,6 +104,8 @@ impl QuickStep {
             map_table: MapTable::new(leaf_upper_bound),
         };
 
+        quickstep.ensure_root_leaf_on_disk();
+
         // initialise root leaf (page 0 for now)
         let root_page = quickstep.map_table.init_leaf_entry(0);
         quickstep.inner_nodes.set_leaf_root(root_page);
@@ -119,6 +120,20 @@ impl QuickStep {
             db: self,
             lock_manager: LockManager::new(),
         }
+    }
+}
+
+impl QuickStep {
+    fn ensure_root_leaf_on_disk(&self) {
+        let mut leaf = self.io_engine.get_page(0);
+        {
+            let meta = leaf.as_mut();
+            if meta.record_count() >= 2 {
+                return;
+            }
+            meta.format_leaf(PageId(0), NodeSize::LeafPage, 0);
+        }
+        self.io_engine.write_page(0, &leaf);
     }
 }
 
@@ -161,17 +176,66 @@ impl<'db> QuickStepTx<'db> {
                 // be because another thread modified the tree which we weren't looking, so we should restart
                 let split_plan = Self::plan_leaf_split(self.db, &mut page_guard);
 
-                let _locks = self
-                    .db
-                    .inner_nodes
-                    .write_lock(res.overflow_point, OpType::Split, key);
+                let lock_bundle =
+                    self.db
+                        .inner_nodes
+                        .write_lock(res.overflow_point, OpType::Split, key);
 
-                let _new_guard = self.new_mini_page(NodeSize::LeafPage, None);
+                let mut lock_bundle = match lock_bundle {
+                    Ok(l) => l,
+                    Err(e) => return Err(e),
+                };
 
-                todo!(
-                    "leaf splitting is not yet implemented. planned pivot={:?}",
-                    split_plan.pivot_key
-                );
+                let mut right_guard = self.new_mini_page(NodeSize::LeafPage, None);
+
+                let split_outcome = Self::apply_leaf_split(
+                    self.db,
+                    &mut page_guard,
+                    &mut right_guard,
+                    &split_plan,
+                )?;
+
+                if let Some(parent_guard) = lock_bundle.chain.last_mut() {
+                    match parent_guard.as_mut().insert_leaf_entry_after_child(
+                        page_guard.page_id(),
+                        &split_outcome.pivot_key,
+                        right_guard.page_id(),
+                    ) {
+                        Ok(()) => {}
+                        Err(QSError::NodeFull) => {
+                            todo!("parent splits are not yet implemented");
+                        }
+                        Err(e @ QSError::ParentChildMissing) => return Err(e),
+                        Err(e) => return Err(e),
+                    }
+                } else {
+                    self.db.inner_nodes.promote_leaf_root(
+                        lock_bundle
+                            .root_lock
+                            .as_mut()
+                            .expect("root lock must exist for root split"),
+                        page_guard.page_id(),
+                        right_guard.page_id(),
+                        &split_outcome.pivot_key,
+                    )?;
+                }
+
+                let pivot = split_outcome.pivot_key.as_slice();
+                let target_guard = if key >= pivot {
+                    &mut right_guard
+                } else {
+                    &mut page_guard
+                };
+
+                match Self::try_put_with_promotion(self.db, target_guard, key, val)? {
+                    TryPutResult::Success => return Ok(()),
+                    TryPutResult::NeedsSplit => {
+                        todo!("split cascading is not yet implemented");
+                    }
+                    TryPutResult::NeedsPromotion(_) => {
+                        unreachable!("promotion handled before returning")
+                    }
+                }
             }
             TryPutResult::NeedsPromotion(_) => unreachable!("promotion handled before returning"),
         }
@@ -193,7 +257,7 @@ fn resolve_data_path(path: &Path) -> PathBuf {
 impl<'db> QuickStepTx<'db> {
     fn plan_leaf_split(
         db: &'db QuickStep,
-        page_guard: &mut WriteGuardWrapper<'_, 'db>,
+        page_guard: &mut WriteGuardWrapper<'db>,
     ) -> LeafSplitPlan {
         let write_guard = page_guard.get_write_guard();
         match write_guard.node() {
@@ -205,9 +269,39 @@ impl<'db> QuickStepTx<'db> {
         }
     }
 
-    fn try_put_with_promotion<'guard>(
+    fn apply_leaf_split(
         db: &'db QuickStep,
-        page_guard: &mut WriteGuardWrapper<'guard, 'db>,
+        left_guard: &mut WriteGuardWrapper<'db>,
+        right_guard: &mut WriteGuardWrapper<'db>,
+        plan: &LeafSplitPlan,
+    ) -> Result<LeafSplitOutcome, QSError> {
+        let left_index = match left_guard.get_write_guard().node() {
+            NodeRef::MiniPage(idx) => idx,
+            NodeRef::Leaf(_) => return Err(QSError::SplitFailed),
+        };
+
+        let right_index = match right_guard.get_write_guard().node() {
+            NodeRef::MiniPage(idx) => idx,
+            NodeRef::Leaf(_) => return Err(QSError::SplitFailed),
+        };
+
+        let copy_bytes = unsafe { db.cache.get_meta_ref(left_index).size().size_in_bytes() };
+
+        unsafe {
+            let src = db.cache.get_meta_ptr(left_index.index) as *const u8;
+            let dst = db.cache.get_meta_ptr(right_index.index) as *mut u8;
+            ptr::copy_nonoverlapping(src, dst, copy_bytes);
+        }
+
+        let left_meta = unsafe { db.cache.get_meta_mut(left_index) };
+        let right_meta = unsafe { db.cache.get_meta_mut(right_index) };
+
+        plan.apply(left_meta, right_meta)
+            .map_err(|_| QSError::SplitFailed)
+    }
+    fn try_put_with_promotion(
+        db: &'db QuickStep,
+        page_guard: &mut WriteGuardWrapper<'db>,
         key: &[u8],
         val: &[u8],
     ) -> Result<TryPutResult, QSError> {
@@ -223,38 +317,47 @@ impl<'db> QuickStepTx<'db> {
 
     fn promote_leaf_to_mini_page(
         db: &'db QuickStep,
-        page_guard: &mut WriteGuardWrapper<'_, 'db>,
+        page_guard: &mut WriteGuardWrapper<'db>,
         disk_addr: u64,
     ) -> Result<(), QSError> {
-        let disk_leaf = page_guard.load_leaf(&db.io_engine, disk_addr)?;
-        debug_assert!(
-            disk_leaf.as_ref().record_count() >= 2,
-            "Leaf page {} missing fence keys; initialization incomplete",
-            disk_addr
-        );
         let cache_index = db
             .cache
             .alloc(NodeSize::LeafPage)
             .ok_or(QSError::CacheExhausted)?;
 
+        let disk_leaf = page_guard.load_leaf(&db.io_engine, disk_addr)?;
+        let src_ptr = disk_leaf.as_ref() as *const NodeMeta as *const u8;
+        let leaf_bytes = NodeSize::LeafPage.size_in_bytes();
+
         unsafe {
-            let dst = db.cache.get_meta_ptr(cache_index) as *mut u8;
-            let src = disk_leaf.as_ref() as *const NodeMeta as *const u8;
-            ptr::copy_nonoverlapping(src, dst, NodeSize::LeafPage.size_in_bytes());
             let mini_index = MiniPageIndex::new(cache_index);
-            page_guard.get_write_guard().set_mini_page(mini_index);
+            let write_guard = page_guard.get_write_guard();
+            let logical_page = write_guard.page;
+            write_guard.set_mini_page(mini_index);
+
+            let dst = db.cache.get_meta_ptr(cache_index) as *mut u8;
+            ptr::copy_nonoverlapping(src_ptr, dst, leaf_bytes);
+            let node_meta = db.cache.get_meta_mut(mini_index);
+            debug_assert!(
+                node_meta.record_count() >= 2,
+                "disk leaf for page {} missing fence keys",
+                logical_page.0
+            );
         }
 
         Ok(())
     }
 
-    fn new_mini_page<'tx>(
-        &'tx mut self,
-        size: NodeSize,
-        disk_addr: Option<u64>,
-    ) -> WriteGuardWrapper<'tx, 'db> {
+    fn new_mini_page(&mut self, size: NodeSize, disk_addr: Option<u64>) -> WriteGuardWrapper<'db> {
         let new_mini_page = self.db.cache.alloc(size).expect("todo");
 
-        unsafe { NodeMeta::init(self, new_mini_page, size, disk_addr) }
+        let mut guard = unsafe { NodeMeta::init(self, new_mini_page, size, disk_addr) };
+
+        if let NodeRef::MiniPage(index) = guard.get_write_guard().node() {
+            let meta = unsafe { self.db.cache.get_meta_mut(index) };
+            meta.ensure_fence_keys();
+        }
+
+        guard
     }
 }

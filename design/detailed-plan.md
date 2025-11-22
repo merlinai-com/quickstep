@@ -75,18 +75,21 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
 
 2. **Implementation plan**
    1. Extend `NodeMeta` helpers:
-      - ✅ Added record-count setters plus `inc_record_count` / `dec_record_count`.
+      - ✅ Added record-count setters plus `inc_record_count` / `dec_record_count`, and taught `try_put` to bump the count whenever a new user entry is materialised.
+      - ✅ Reworked `NodeMeta::binary_search` to operate on inclusive user-entry bounds (fences excluded), so cache-only lookups succeed immediately after promotion.
       - ✅ Added `LeafEntryIter` iterator to yield `(KVMeta, key_suffix, value)` triples without duplicating pointer arithmetic.
-      - 🔜 Add a `reset_contents()` + `replay_entries()` pair so the left-hand mini-page can be zeroed and repopulated via the existing insertion path (no bespoke serializer). This is the first actionable task before we touch the split flow again.
+      - ✅ Added `NodeMeta::reset_user_entries` (keeps the two fence keys, drops everything else) plus `NodeMeta::replay_entries` to reinsert owned `(key, value)` pairs through the existing `try_put` path. Leaves can now be rebuilt without bespoke serializers.
    2. Build/apply the split helper:
-      - ✅ Implemented `LeafSplitPlan::from_node` (reads the existing mini-page, identifies pivot key, and prepares owned `(key, value)` pairs for the right-hand page).
-      - 🔜 Implement `LeafSplitPlan::apply`:
-        * Input: the plan above, a mutable reference to the original (left) mini-page, and a freshly allocated right-hand mini-page (`NodeMeta`).
-        * Steps: wipe the left page, replay only the retained entries, populate the right page from the owned `(key, value)` pairs, and expose the separator key.
-        * Result: Two valid leaves, plus a `LeafSplitOutcome` struct carrying the pivot key and child page IDs for the parent update.
+      - ✅ Implemented `LeafSplitPlan::from_node` (reads the existing mini-page, identifies pivot key, and prepares owned `(key, value)` pairs for both halves).
+      - ✅ Implemented `LeafSplitPlan::apply` + `LeafSplitOutcome`:
+        * Input: the plan above, a mutable reference to the original (left) mini-page, and a freshly allocated right-hand mini-page that starts as a byte-for-byte copy of the left page.
+        * Steps: clone the source page into the destination, call `reset_user_entries` on both leaves, replay the retained entries into the left page and the moved entries into the right page via the existing `try_put` path, then surface the separator key via `LeafSplitOutcome`.
+        * Result: Two valid leaves containing disjoint halves of the original user entries plus the pivot key we need for the parent update (child wiring still todo).
+      - ✅ Reworked the lock manager to hand out stable write-guard handles so we can keep the original leaf locked while allocating/promoting the new right-hand mini-page.
    3. Parent/root updates:
-      - 🔜 Teach `BPTree` a `promote_leaf_root` helper that installs a minimal inner node with two children when the current root splits.
-      - 🔜 For non-root leaves, plumb a `ParentInsert` struct that captures the separator key + right child ID and hands it to the (future) inner-node insert path. Inner splits can stay `todo!()` if we clearly mark the missing recursive step.
+      - ✅ Taught `BPTree` a `promote_leaf_root` helper that allocates a fresh inner node, installs the pivot + child pointers, and swaps the root pointer under the root write-lock.
+      - ✅ Added a temporary parent-insert path for level-1 inner nodes: we collect the root’s `(key, child)` entries, insert the new pivot/right-child pair, and rebuild the node in place. This unblocks non-root leaf splits while we design cascading inner splits.
+      - 🔜 For deeper trees, replace the rebuild helper with an incremental insert + cascading split flow so we can bubble splits up the inner levels.
       - 🔜 Update `MapTable` + `NodeRef` bookkeeping so the new right leaf becomes reachable immediately after the left leaf is rebuilt.
 
 3. **Testing**
@@ -97,6 +100,6 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
    - Add negative test ensuring that after the split, inserting additional keys routes to the correct leaf.
 
 4. **Open questions**
-   - Need to confirm the expected initial fence-key layout for brand-new leaves (currently inferred via debug assertion). If the format differs from Raphael’s reference implementation, we may need to add an explicit “format_leaf” step during bootstrap.
+   - ✅ Resolved 22 Nov 2025: `QuickStep::new` now formats page 0 on disk (header + sentinel fence keys) before bootstrapping the map table, and every subsequent mini-page allocation calls `ensure_fence_keys` so promotion no longer needs a bootstrap path.
    - Inner-node serialization helpers are not implemented yet (`BPNode` currently only supports searching). We will implement just enough (key insertion + child pointer storage) for the root case in this phase.
 

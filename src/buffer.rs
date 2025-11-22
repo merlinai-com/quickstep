@@ -84,7 +84,7 @@ impl MiniPageBuffer {
         for _ in 0..SPIN_RETRIES {
             let head = self.head.load(Ordering::Acquire);
 
-            match head < tail {
+            match head <= tail {
                 // barrier is end of buffer
                 true => {
                     let free_space_words = self.buff_size - tail;

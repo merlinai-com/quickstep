@@ -1,4 +1,4 @@
-use std::{collections::HashMap, mem};
+use std::{collections::HashMap, marker::PhantomData, mem, ptr::NonNull};
 
 use crate::{
     error::QSError,
@@ -8,7 +8,21 @@ use crate::{
 
 // TODO: optimise
 pub struct LockManager<'a> {
-    locks: HashMap<u64, PageGuard<'a>>,
+    locks: HashMap<u64, Box<LockSlot<'a>>>,
+}
+
+struct LockSlot<'a> {
+    guard: PageGuard<'a>,
+    borrowed: bool,
+}
+
+impl<'a> LockSlot<'a> {
+    fn new(guard: PageGuard<'a>) -> LockSlot<'a> {
+        LockSlot {
+            guard,
+            borrowed: false,
+        }
+    }
 }
 
 // Locks need to be held for the length of the transaction
@@ -20,22 +34,22 @@ impl<'a> LockManager<'a> {
         }
     }
 
-    pub fn insert_write_lock<'tx>(
-        &'tx mut self,
-        guard: PageWriteGuard<'a>,
-    ) -> WriteGuardWrapper<'tx, 'a> {
+    pub fn insert_write_lock(&mut self, guard: PageWriteGuard<'a>) -> WriteGuardWrapper<'a> {
         let id = guard.page.0;
-        let wrapped = PageGuard {
-            guard_inner: GuardWrapper::Write(guard),
-            leaf: None,
-        };
-        self.locks.insert(id, wrapped);
-        let tmp = self
+        self.locks.insert(
+            id,
+            Box::new(LockSlot::new(PageGuard {
+                guard_inner: GuardWrapper::Write(guard),
+                leaf: None,
+            })),
+        );
+
+        let slot = self
             .locks
             .get_mut(&id)
             .expect("We just inserted this value");
 
-        WriteGuardWrapper(tmp)
+        WriteGuardWrapper::new(PageHandle::acquire(slot))
     }
 
     pub fn get_or_acquire_read_lock(
@@ -49,42 +63,46 @@ impl<'a> LockManager<'a> {
 
             self.locks.insert(
                 page.0,
-                PageGuard {
+                Box::new(LockSlot::new(PageGuard {
                     guard_inner: GuardWrapper::Read(guard),
                     leaf: None,
-                },
+                })),
             );
         }
 
-        Ok(self
+        let slot = self
             .locks
             .get_mut(&page.0)
-            .expect("We just ensured that it exists"))
+            .expect("We just ensured that it exists");
+
+        Ok(&mut slot.guard)
     }
 
-    pub fn get_upgrade_or_acquire_write_lock<'tx>(
-        &'tx mut self,
+    pub fn get_upgrade_or_acquire_write_lock(
+        &mut self,
         mapping_table: &'a MapTable,
         page: PageId,
-    ) -> Result<WriteGuardWrapper<'tx, 'a>, QSError> {
+    ) -> Result<WriteGuardWrapper<'a>, QSError> {
         if !self.locks.contains_key(&page.0) {
             let guard = mapping_table.write_page_entry(page)?;
 
             self.locks.insert(
                 page.0,
-                PageGuard {
+                Box::new(LockSlot::new(PageGuard {
                     guard_inner: GuardWrapper::Write(guard),
                     leaf: None,
-                },
+                })),
             );
         }
 
-        let guard = self
+        let slot = self
             .locks
             .get_mut(&page.0)
             .expect("we just added it if it didn't exist");
 
-        guard.ensure_write()
+        slot.guard.ensure_write()?;
+
+        Ok(WriteGuardWrapper::new(PageHandle::acquire(slot)))
     }
 }
 
@@ -93,22 +111,66 @@ pub enum GuardWrapper<'a> {
     Read(PageReadGuard<'a>),
 }
 
-/// Inner page guard is guarenteed to be a write
-pub struct WriteGuardWrapper<'tx, 'a>(&'tx mut PageGuard<'a>);
+pub struct PageHandle<'a> {
+    slot: NonNull<LockSlot<'a>>,
+    _marker: PhantomData<&'a mut LockSlot<'a>>,
+}
 
-impl<'tx, 'a> WriteGuardWrapper<'tx, 'a> {
-    pub unsafe fn new(guard: &'tx mut PageGuard<'a>) -> WriteGuardWrapper<'tx, 'a> {
-        WriteGuardWrapper(guard)
+impl<'a> PageHandle<'a> {
+    fn acquire(slot: &mut LockSlot<'a>) -> PageHandle<'a> {
+        debug_assert!(
+            !slot.borrowed,
+            "Attempted to borrow the same page guard twice"
+        );
+        slot.borrowed = true;
+        PageHandle {
+            slot: NonNull::from(slot),
+            _marker: PhantomData,
+        }
+    }
+
+    fn guard(&self) -> &PageGuard<'a> {
+        unsafe { &self.slot.as_ref().guard }
+    }
+
+    fn guard_mut(&mut self) -> &mut PageGuard<'a> {
+        unsafe { &mut self.slot.as_mut().guard }
+    }
+}
+
+impl<'a> Drop for PageHandle<'a> {
+    fn drop(&mut self) {
+        unsafe {
+            let slot = self.slot.as_mut();
+            debug_assert!(slot.borrowed, "PageHandle dropped twice");
+            slot.borrowed = false;
+        }
+    }
+}
+
+/// Inner page guard is guaranteed to be a write
+pub struct WriteGuardWrapper<'a>(PageHandle<'a>);
+
+impl<'a> WriteGuardWrapper<'a> {
+    fn new(handle: PageHandle<'a>) -> WriteGuardWrapper<'a> {
+        WriteGuardWrapper(handle)
+    }
+
+    pub fn page_id(&self) -> PageId {
+        self.0.guard().page_id()
+    }
+
+    fn guard_mut(&mut self) -> &mut PageGuard<'a> {
+        self.0.guard_mut()
     }
 
     pub fn get_write_guard<'b>(&'b mut self) -> &'b mut PageWriteGuard<'a> {
-        let out = match self.0.guard_inner {
+        match self.guard_mut().guard_inner {
             GuardWrapper::Write(ref mut g) => g,
             GuardWrapper::Read(_) => {
-                unreachable!("WritePageGuard guarentees that we hold a write guard")
+                unreachable!("WritePageGuard guarantees that we hold a write guard")
             }
-        };
-        out
+        }
     }
 
     pub fn load_leaf<'b>(
@@ -116,7 +178,7 @@ impl<'tx, 'a> WriteGuardWrapper<'tx, 'a> {
         io: &IoEngine,
         addr: u64,
     ) -> Result<&'b mut DiskLeaf, QSError> {
-        self.0.load_leaf(io, addr)
+        self.guard_mut().load_leaf(io, addr)
     }
 }
 
@@ -128,6 +190,13 @@ pub struct PageGuard<'a> {
 impl<'a> PageGuard<'a> {
     pub fn is_write(&self) -> bool {
         matches!(self.guard_inner, GuardWrapper::Write(_))
+    }
+
+    pub fn page_id(&self) -> PageId {
+        match &self.guard_inner {
+            GuardWrapper::Write(w) => w.page,
+            GuardWrapper::Read(r) => r.page,
+        }
     }
 
     pub fn load_leaf<'g>(
@@ -148,12 +217,12 @@ impl<'a> PageGuard<'a> {
 
     /// Upgrade to a write transaction, if not already
     /// If it fails it will
-    pub fn ensure_write<'tx>(&'tx mut self) -> Result<WriteGuardWrapper<'tx, 'a>, QSError> {
+    pub fn ensure_write(&mut self) -> Result<(), QSError> {
         let write = match &mut self.guard_inner {
-            GuardWrapper::Write(_) => return Ok(WriteGuardWrapper(self)),
+            GuardWrapper::Write(_) => return Ok(()),
             GuardWrapper::Read(g) => {
                 let ptr = g as *mut PageReadGuard<'a>;
-                // SAFTEY: we have a mutable reference, and aren't going to touch the old value
+                // SAFETY: we have a mutable reference, and aren't going to touch the old value
                 let read_guard = unsafe { ptr.read() };
 
                 match read_guard.upgrade() {
@@ -167,7 +236,7 @@ impl<'a> PageGuard<'a> {
             }
         };
         self.guard_inner = GuardWrapper::Write(write);
-        Ok(WriteGuardWrapper(self))
+        Ok(())
     }
 }
 impl<'a> GuardWrapper<'a> {

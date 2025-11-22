@@ -1,5 +1,15 @@
 # Changelog
 
+#### 2025-11-22 10:45 UTC [pending] [main]
+
+##### Phase 1.3 bootstrap hardening + node fixes
+
+- `QuickStep::new` now formats page 0 on disk (header + sentinel fence keys) before inserting the root into the map table, ensuring every promotion sees a well-defined leaf image.
+- `QuickStepTx::promote_leaf_to_mini_page` is copy-only: we allocate a cache slot, memcpy the on-disk leaf, and assert the fence invariants instead of patching headers on the fly.
+- `NodeMeta::try_put` increments the record count when adding user entries, its metadata shift logic no longer overruns the array, and `binary_search` now excludes the two fence slots. Added `node::tests::node_try_put_roundtrip` to cover the path.
+- Documentation updates: roadmap includes a progress column, and `design/detailed-plan.md` captures the disk-format decision.
+- Tests: `cargo test node::tests::node_try_put_roundtrip` and `cargo test insert_and_read_back` (PASS, known warnings remain).
+
 #### 2025-11-21 22:54 UTC [pending] [main]
 
 ##### Phase 1.2 Option A – promote leaves into mini-pages

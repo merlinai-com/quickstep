@@ -1,4 +1,7 @@
-use std::{error::Error, mem::transmute};
+use std::{
+    error::Error,
+    mem::{size_of, transmute},
+};
 
 use crate::{
     buffer::{MiniPageBuffer, MiniPageIndex},
@@ -28,7 +31,7 @@ impl KVMeta {
         let mut acc = 0;
         acc |= (key_size as u64) << 50;
         acc |= (val_size as u64) << 36;
-        acc |= (offset as u64) << 36;
+        acc |= (offset as u64) << 20;
         acc |= (typ as u64) << 18;
         acc |= (is_fence as u64) << 17;
         acc |= (refb as u64) << 16;
@@ -211,12 +214,12 @@ impl NodeMeta {
     //     self.0
     // }
 
-    pub unsafe fn init<'tx, 'db>(
-        tx: &'tx mut QuickStepTx<'db>,
+    pub unsafe fn init<'db>(
+        tx: &mut QuickStepTx<'db>,
         index: usize,
         size: NodeSize,
         disk_addr: Option<u64>,
-    ) -> WriteGuardWrapper<'tx, 'db> {
+    ) -> WriteGuardWrapper<'db> {
         let node_ptr = tx.db.cache.get_meta_ptr(index);
         let disk_addr = disk_addr.unwrap_or_else(|| tx.db.io_engine.get_new_addr());
         let guard = tx.db.map_table.create_page_entry(MiniPageIndex::new(index));
@@ -293,6 +296,18 @@ impl NodeMeta {
     #[inline]
     pub fn page_id(&self) -> PageId {
         PageId(self.1 >> 16)
+    }
+
+    pub fn reset_header(&mut self, page_id: PageId, size: NodeSize, disk_addr: u64) {
+        let mut w0 = (disk_addr as u64) << 16;
+        w0 |= (size as u64) << 13;
+        w0 |= 1 << 10;
+        self.0 = w0;
+
+        let free = size.size_in_bytes() - size_of::<NodeMeta>();
+        let mut w1 = (page_id.0) << 16;
+        w1 |= (free as u64) & 0xFFFF;
+        self.1 = w1;
     }
 
     #[inline]
