@@ -13,6 +13,7 @@ use crate::{
     map_table::MapTable,
     page_op::flush_dirty_entries,
     types::{NodeMeta, NodeRef, NodeSize},
+    wal::WalManager,
     SPIN_RETRIES,
 };
 
@@ -183,7 +184,12 @@ impl MiniPageBuffer {
         None
     }
 
-    pub fn evict(&self, map_table: &MapTable, io_engine: &IoEngine) -> Result<(), QSError> {
+    pub fn evict(
+        &self,
+        map_table: &MapTable,
+        io_engine: &IoEngine,
+        wal: &WalManager,
+    ) -> Result<(), QSError> {
         // scan through items in the last chance zone
         // for each:
         // de mark ref bit,
@@ -237,6 +243,8 @@ impl MiniPageBuffer {
             flush_dirty_entries(meta, io_engine);
 
             let disk_addr = meta.leaf();
+            wal.checkpoint_leaf(disk_addr)
+                .expect("failed to checkpoint WAL during eviction");
             guard.set_leaf(disk_addr);
             meta.set_live(false);
             meta.clear_eviction();

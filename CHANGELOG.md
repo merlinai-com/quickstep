@@ -2,6 +2,30 @@
 
 # Changelog
 
+# Changelog
+
+# Changelog
+
+#### 2025-11-22 17:05 UTC [pending] [main]
+
+##### Phase 1.3 WAL puts + crash tests
+
+- Extended `WalManager` to encode both put (`{page_id, disk_addr, key, value}`) and tombstone records, track per-leaf counts/bytes, and expose a global “noisiest leaf” candidate so we can automatically trim the WAL when it grows too large.
+- `QuickStepTx::put`/`delete` now log WAL entries, run per-leaf checkpoints once a leaf crosses `WAL_LEAF_CHECKPOINT_THRESHOLD`, and invoke the global checkpoint hook when the overall WAL exceeds either the record or byte threshold.
+- Added `tests/quickstep_delete_persist.rs::wal_replays_puts_without_manual_flush` plus `wal_auto_checkpoint_trims_entries`; executed via `cargo test quickstep_delete_persist` and `cargo test quickstep_merge`.
+- Docs: README, detailed plan, changelog, and coding history now describe the broader WAL coverage, background checkpointing, and new crash tests.
+- Configuration/observability: `QuickStepConfig::with_wal_thresholds(...)` lets deployments tune the per-leaf/global record + byte thresholds without code changes, `QuickStep::debug_wal_stats` exposes WAL usage for tests/monitoring, and a lightweight background monitor thread now requests checkpoints when global thresholds are exceeded.
+
+#### 2025-11-22 16:25 UTC [pending] [main]
+
+##### Phase 1.3 minimal WAL + delete persistence tests
+
+- Introduced `WalManager` (`src/wal.rs`) plus `.wal` sidecar files: every delete now appends `{page_id, disk_addr, key}` records with fsync-before-return semantics, and eviction/explicit flush checkpoints prune per-leaf log entries.
+- `QuickStep::replay_wal()` runs during start-up to reapply queued tombstones to on-disk leaves before the cache/map-table bootstrap completes, then truncates the WAL to zero once replay succeeds.
+- `QuickStepTx::delete` logs tombstones before auto-merge evaluation; `MiniPageBuffer::evict` + `QuickStep::debug_flush_root_leaf` checkpoint the WAL once dirty leaves hit disk, ensuring redo-free restarts.
+- Tests: `tests/quickstep_delete_persist.rs` now includes `wal_replays_deletes_without_manual_flush`, which deletes keys without flushing, drops the DB handle, and validates that reopening replays the WAL; re-ran `cargo test quickstep_delete_persist` and `cargo test quickstep_merge`.
+- Docs: `design/detailed-plan.md` tombstone/WAL section, README status table, and Coding History all describe the minimal WAL flow, checkpoint ordering, and new test coverage.
+
 #### 2025-11-22 15:40 UTC [pending] [main]
 
 ##### Phase 1.3 tombstone deletes + cascading merge fixes

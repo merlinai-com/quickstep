@@ -104,6 +104,11 @@ impl KVMeta {
     }
 
     #[inline]
+    pub fn is_dirty(&self) -> bool {
+        matches!(self.typ(), KVRecordType::Insert | KVRecordType::Tombstone)
+    }
+
+    #[inline]
     pub fn set_record_type(mut self, typ: KVRecordType) -> KVMeta {
         const MASK: u64 = 0b11 << 18;
         self.0 &= !MASK;
@@ -127,6 +132,7 @@ impl KVMeta {
 // | TOMBSTONE |  true  |  false  |
 // | PHANTOM   |  false |  false  |
 // +-----------+--------+---------+
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum KVRecordType {
     Insert = 0b11,

@@ -78,24 +78,25 @@ cargo doc --open
 - Leaf node prefix compression
 - Key-value metadata encoding
 - `QuickStep::new()` bootstraps the tree, cache, and map table, formatting the root leaf (page 0) on disk before the first transaction
+- Delete/tombstone plumbing persists user-key removals via mini-page flush, WAL replay on restart, and instrumentation-backed tests
+- Minimal WAL support (puts + deletes) replays cached updates during startup, per-leaf checkpoints prune the log, and a global WAL pressure monitor flushes the busiest leaves when the log grows too large
+- Configurable WAL thresholds via `QuickStepConfig::with_wal_thresholds(...)`, plus debug WAL stats (`QuickStep::debug_wal_stats`) and a lightweight background WAL monitor for observability/auto-checkpointing
 
 ### ⚠️ Partially Implemented
 
 - Put/get operations (mini-page promotion + cache writes are in place; cascading parent splits bubble to the root and publish new map-table entries immediately, while merge/eviction policies are still being fleshed out)
 - Leaf split logic (Phase 1.3 now exercises root splits, cascading inner splits, and root promotions via instrumentation-backed integration tests; remaining work focuses on merge handling)
 - Buffer eviction (baseline FIFO eviction flushes dirty mini-pages back to disk and updates the map table in place; second-chance policy & mixed-size freelists are still TODO)
-- Delete/merge path (basic delete API promotes leaves, marks tombstones, auto-merges underfull siblings, and updates parents; durable WAL + range deletes still pending)
+- Delete/merge path (delete API now logs tombstones through the WAL, replays them during restart, triggers per-leaf checkpoints, and auto-merges underfilled siblings; range deletes + multi-level recovery semantics remain TODO)
 - Merge logic (leaf-level merge plan, parent rewiring, root demotion, and merge instrumentation are implemented; delete-triggered thresholds and non-root cascading merges are still outstanding)
 - Buffer eviction (structure present, merge-to-disk incomplete)
-- I/O engine (read/write path works; metadata/WAL integration still TBD)
+- I/O engine (read/write path works; WAL still lacks redo/undo for complex transactions and finer-grained checkpoint orchestration)
 
 ### ❌ Not Yet Implemented
 
 - Transaction commit/abort
-- Split/merge operations
-- Recovery/WAL (write-ahead logging)
+- Full redo/undo logging for values beyond delete tombstones + crash-safe checkpoints
 - Range queries
-- Delete operations
 
 For a detailed breakdown, see [`design/codebase-analysis.md`](design/codebase-analysis.md).
 

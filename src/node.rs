@@ -138,12 +138,24 @@ impl NodeMeta {
 
     fn mark_entry_tombstone(&mut self, idx: usize) -> bool {
         let mut kv = self.get_kv_meta(idx);
-        if kv.fence() || !kv.typ().exists() {
+        if kv.fence() || kv.typ() == KVRecordType::Tombstone {
             return false;
         }
         kv = kv.set_record_type(KVRecordType::Tombstone);
         self.set_kv_meta(idx, kv);
         true
+    }
+
+    pub fn remove_key_physical(&mut self, key: &[u8]) -> bool {
+        let prefix = self.get_node_prefix();
+        if !key.starts_with(prefix) {
+            return false;
+        }
+        let suffix = &key[prefix.len()..];
+        match self.binary_search(suffix) {
+            Ok(idx) => self.remove_entry(idx),
+            Err(_) => false,
+        }
     }
 
     fn remove_entry(&mut self, idx: usize) -> bool {

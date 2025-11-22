@@ -112,6 +112,15 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
       - ✅ **Delete-trigger**: `QuickStep::delete` and `QuickStepTx::delete` remove keys from leaves, drop record counts, and invoke the auto-merge helper when occupancy falls below the threshold.
       - ✅ **Tests**: `tests/quickstep_merge.rs` simulates delete-driven merges by truncating leaves, calling the delete API, and verifying both root demotion and “root stays inner but loses a child” scenarios via the new debug helpers.
 
+   6. Tombstone + WAL planning (current)
+      - ✅ **Tombstone format**: deletes materialise as `KVRecordType::Tombstone` entries that still contain the user-key suffix; iterators skip them, but `flush_dirty_entries` interprets them as physical removes.
+      - ✅ **Dirty tracking**: delete paths flag tombstone entries as dirty so cache eviction / manual flush rewrites the disk leaf before reclaiming the cache slot.
+      - ✅ **Flush semantics**: `flush_dirty_entries` now removes tombstoned keys from the `DiskLeaf`, rewrites surviving entries, then checkpoints the WAL for that leaf.
+      - ✅ **WAL hook**: introduced `WalManager` (length-prefixed binary log) recording `{page_id, disk_addr, key}` for deletes and `{page_id, disk_addr, key, value}` for inserts; append paths fsync every record before returning to the caller.
+      - ✅ **Crash protocol**: on startup `QuickStep::replay_wal()` replays pending puts/tombstones into `IoEngine` pages and truncates the `.wal` file once the reapply succeeds; runtime checkpoints prune per-leaf records after eviction/flush.
+      - ✅ **Testing**: `tests/quickstep_delete_persist.rs` now covers both crash scenarios—`wal_replays_deletes_without_manual_flush` for deletes and `wal_replays_puts_without_manual_flush` for inserts.
+      - ✅ **Global pressure**: background policy monitors total WAL length (records + bytes) and proactively checkpoints the “noisiest” leaves once thresholds are exceeded; per-leaf stats track record counts/bytes so flushes remove the right entries without blocking foreground writes. Configurable thresholds + WAL debug stats (`QuickStep::debug_wal_stats`) keep observability high for tuning, and a lightweight background monitor thread now raises checkpoint requests when limits are exceeded.
+
 3. **Testing**
    - ✅ Added `tests/quickstep_split.rs::root_split_occurs_and_is_readable`:
      1. Inserts large payloads until the first split occurs, asserting `debug::split_requests() == 1`.

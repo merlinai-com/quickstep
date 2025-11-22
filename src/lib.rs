@@ -9,6 +9,12 @@
 use std::{
     path::{Path, PathBuf},
     ptr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
+    time::Duration,
 };
 
 use crate::{
@@ -20,6 +26,7 @@ use crate::{
     map_table::{MapTable, PageId},
     page_op::{LeafMergePlan, LeafSplitOutcome, LeafSplitPlan, TryPutResult},
     types::{NodeMeta, NodeRef, NodeSize},
+    wal::{WalManager, WalOp, WalRecord},
 };
 
 pub mod btree;
@@ -34,6 +41,7 @@ pub mod page_op;
 pub mod rand;
 pub mod types;
 pub mod utils;
+pub mod wal;
 
 pub const SPIN_RETRIES: usize = 2 ^ 12;
 
@@ -49,15 +57,34 @@ pub struct QuickStep {
     io_engine: IoEngine,
     /// The map from page ids to their location, either in the mini-page buffer or on disk
     map_table: MapTable,
+    /// Write-ahead log for tombstones/deletes
+    wal: Arc<WalManager>,
+    wal_leaf_checkpoint_threshold: usize,
+    wal_global_record_threshold: usize,
+    wal_global_byte_threshold: usize,
+    wal_checkpoint_requested: Arc<AtomicBool>,
+    wal_checkpoint_stop: Arc<AtomicBool>,
+    wal_checkpoint_thread: Option<thread::JoinHandle<()>>,
 }
 
 const AUTO_MERGE_MIN_ENTRIES: usize = 3;
+const DEFAULT_WAL_LEAF_CHECKPOINT_THRESHOLD: usize = 32;
+const DEFAULT_WAL_GLOBAL_RECORD_THRESHOLD: usize = 1024;
+const DEFAULT_WAL_GLOBAL_BYTE_THRESHOLD: usize = 512 * 1024;
 
 #[derive(Debug)]
 pub struct DebugLeafSnapshot {
     pub page_id: PageId,
     pub disk_addr: u64,
     pub keys: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub struct DebugWalStats {
+    pub total_records: usize,
+    pub total_bytes: usize,
+    pub leaf_records: Option<usize>,
+    pub leaf_bytes: Option<usize>,
 }
 
 /// Config to create a new QuickStep instance
@@ -73,6 +100,9 @@ pub struct QuickStepConfig {
     /// 30 - 1gb
     /// 40 - 2tb
     cache_size_lg: usize,
+    wal_leaf_checkpoint_threshold: usize,
+    wal_global_record_threshold: usize,
+    wal_global_byte_threshold: usize,
 }
 
 impl QuickStepConfig {
@@ -87,7 +117,30 @@ impl QuickStepConfig {
             inner_node_upper_bound,
             leaf_upper_bound,
             cache_size_lg,
+            wal_leaf_checkpoint_threshold: DEFAULT_WAL_LEAF_CHECKPOINT_THRESHOLD,
+            wal_global_record_threshold: DEFAULT_WAL_GLOBAL_RECORD_THRESHOLD,
+            wal_global_byte_threshold: DEFAULT_WAL_GLOBAL_BYTE_THRESHOLD,
         }
+    }
+
+    pub fn with_wal_thresholds(
+        mut self,
+        leaf_checkpoint: usize,
+        global_record: usize,
+        global_bytes: usize,
+    ) -> QuickStepConfig {
+        self.wal_leaf_checkpoint_threshold = leaf_checkpoint;
+        self.wal_global_record_threshold = global_record;
+        self.wal_global_byte_threshold = global_bytes;
+        self
+    }
+
+    pub fn wal_thresholds(&self) -> (usize, usize, usize) {
+        (
+            self.wal_leaf_checkpoint_threshold,
+            self.wal_global_record_threshold,
+            self.wal_global_byte_threshold,
+        )
     }
 }
 
@@ -98,22 +151,56 @@ impl QuickStep {
             inner_node_upper_bound,
             leaf_upper_bound,
             cache_size_lg,
+            wal_leaf_checkpoint_threshold,
+            wal_global_record_threshold,
+            wal_global_byte_threshold,
         } = config;
 
         let data_path = resolve_data_path(&path);
 
         let io_engine =
             IoEngine::open(&data_path).expect("failed to open quickstep data file for writing");
+        let wal_path = wal_path_for(&data_path);
+        let wal = Arc::new(
+            WalManager::open(&wal_path).expect("failed to open quickstep write-ahead log file"),
+        );
         let cache = MiniPageBuffer::new(cache_size_lg);
+        let wal_checkpoint_requested = Arc::new(AtomicBool::new(false));
+        let wal_checkpoint_stop = Arc::new(AtomicBool::new(false));
+        let wal_checkpoint_thread = {
+            let wal_clone = Arc::clone(&wal);
+            let stop_clone = Arc::clone(&wal_checkpoint_stop);
+            let flag_clone = Arc::clone(&wal_checkpoint_requested);
+            let record_thresh = wal_global_record_threshold;
+            let byte_thresh = wal_global_byte_threshold;
+            Some(thread::spawn(move || {
+                while !stop_clone.load(Ordering::Relaxed) {
+                    if wal_clone.total_records() >= record_thresh
+                        || wal_clone.total_bytes() >= byte_thresh
+                    {
+                        flag_clone.store(true, Ordering::Release);
+                    }
+                    thread::sleep(Duration::from_millis(50));
+                }
+            }))
+        };
 
         let mut quickstep = QuickStep {
             inner_nodes: BPTree::new(inner_node_upper_bound),
             cache,
             io_engine,
             map_table: MapTable::new(leaf_upper_bound),
+            wal,
+            wal_leaf_checkpoint_threshold,
+            wal_global_record_threshold,
+            wal_global_byte_threshold,
+            wal_checkpoint_requested,
+            wal_checkpoint_stop,
+            wal_checkpoint_thread,
         };
 
         quickstep.ensure_root_leaf_on_disk();
+        quickstep.replay_wal();
 
         // initialise root leaf (page 0 for now)
         let root_page = quickstep.map_table.init_leaf_entry(0);
@@ -128,6 +215,15 @@ impl QuickStep {
         QuickStepTx {
             db: self,
             lock_manager: LockManager::new(),
+        }
+    }
+}
+
+impl Drop for QuickStep {
+    fn drop(&mut self) {
+        self.wal_checkpoint_stop.store(true, Ordering::Release);
+        if let Some(handle) = self.wal_checkpoint_thread.take() {
+            let _ = handle.join();
         }
     }
 }
@@ -180,6 +276,56 @@ impl QuickStep {
         };
         Ok(snapshot)
     }
+
+    pub fn debug_wal_stats(&self, disk_addr: Option<u64>) -> DebugWalStats {
+        let (leaf_records, leaf_bytes) = disk_addr
+            .and_then(|addr| self.wal.leaf_stats(addr))
+            .map(|(_, records, bytes)| (Some(records), Some(bytes)))
+            .unwrap_or((None, None));
+
+        DebugWalStats {
+            total_records: self.wal.total_records(),
+            total_bytes: self.wal.total_bytes(),
+            leaf_records,
+            leaf_bytes,
+        }
+    }
+
+    fn replay_wal(&self) {
+        let records = self.wal.records();
+        if records.is_empty() {
+            return;
+        }
+        for record in records.iter() {
+            self.apply_wal_record(record);
+        }
+        self.wal.clear().expect("failed to clear WAL after replay");
+    }
+
+    fn apply_wal_record(&self, record: &WalRecord) {
+        let mut leaf = self.io_engine.get_page(record.disk_addr);
+        let meta = leaf.as_mut();
+        if meta.record_count() < 2 {
+            meta.format_leaf(PageId(record.page_id), NodeSize::LeafPage, record.disk_addr);
+        }
+
+        match &record.op {
+            WalOp::Tombstone => {
+                if meta.remove_key_physical(&record.key) {
+                    self.io_engine.write_page(record.disk_addr, &leaf);
+                }
+            }
+            WalOp::Put { value } => {
+                meta.try_put(&record.key, value)
+                    .expect("disk leaf should accept WAL replay");
+                self.io_engine.write_page(record.disk_addr, &leaf);
+            }
+        }
+    }
+
+    pub fn debug_wal_record_count(&self) -> usize {
+        self.wal.total_records()
+    }
 }
 
 pub struct QuickStepTx<'db> {
@@ -213,7 +359,11 @@ impl<'db> QuickStepTx<'db> {
             .get_upgrade_or_acquire_write_lock(&self.db.map_table, res.page)?;
 
         match Self::try_put_with_promotion(self.db, &mut page_guard, key, val)? {
-            TryPutResult::Success => return Ok(()),
+            TryPutResult::Success => {
+                Self::append_wal_put(self.db, &mut page_guard, key, val)?;
+                self.maybe_global_checkpoint()?;
+                return Ok(());
+            }
             TryPutResult::NeedsSplit => {
                 // We know which locks we need, so try to acquire them, if we fail then it might
                 // be because another thread modified the tree which we weren't looking, so we should restart
@@ -261,7 +411,11 @@ impl<'db> QuickStepTx<'db> {
                 };
 
                 match Self::try_put_with_promotion(self.db, target_guard, key, val)? {
-                    TryPutResult::Success => return Ok(()),
+                    TryPutResult::Success => {
+                        Self::append_wal_put(self.db, target_guard, key, val)?;
+                        self.maybe_global_checkpoint()?;
+                        return Ok(());
+                    }
                     TryPutResult::NeedsSplit => {
                         todo!("split cascading is not yet implemented");
                     }
@@ -287,6 +441,12 @@ fn resolve_data_path(path: &Path) -> PathBuf {
     }
 }
 
+fn wal_path_for(data_path: &Path) -> PathBuf {
+    let mut wal_path = data_path.to_path_buf();
+    wal_path.set_extension("wal");
+    wal_path
+}
+
 impl<'db> QuickStepTx<'db> {
     fn plan_leaf_split(
         db: &'db QuickStep,
@@ -300,6 +460,75 @@ impl<'db> QuickStepTx<'db> {
             }
             NodeRef::Leaf(_) => unreachable!("leaf splits only apply to cached mini-pages"),
         }
+    }
+
+    fn append_wal_put(
+        db: &'db QuickStep,
+        guard: &mut WriteGuardWrapper<'db>,
+        key: &[u8],
+        val: &[u8],
+    ) -> Result<(), QSError> {
+        let disk_addr = match guard.get_write_guard().node() {
+            NodeRef::MiniPage(idx) => unsafe { db.cache.get_meta_ref(idx) }.leaf(),
+            NodeRef::Leaf(addr) => addr,
+        };
+        db.wal
+            .append_put(guard.page_id(), disk_addr, key, val)
+            .expect("failed to record put in WAL");
+        Self::maybe_checkpoint_leaf(db, guard, disk_addr)?;
+        Ok(())
+    }
+
+    fn maybe_checkpoint_leaf(
+        db: &'db QuickStep,
+        guard: &mut WriteGuardWrapper<'db>,
+        disk_addr: u64,
+    ) -> Result<(), QSError> {
+        if !db
+            .wal
+            .should_checkpoint(disk_addr, db.wal_leaf_checkpoint_threshold)
+        {
+            return Ok(());
+        }
+        Self::ensure_mini_page(db, guard)?;
+        guard.merge_to_disk(&db.cache, &db.io_engine);
+        db.wal
+            .checkpoint_leaf(disk_addr)
+            .expect("failed to checkpoint WAL for leaf");
+        Ok(())
+    }
+
+    fn maybe_global_checkpoint(&mut self) -> Result<(), QSError> {
+        let requested = self.db.wal_checkpoint_requested.load(Ordering::Acquire);
+        let candidate = self
+            .db
+            .wal
+            .global_checkpoint_candidate(
+                self.db.wal_global_record_threshold,
+                self.db.wal_global_byte_threshold,
+            )
+            .or_else(|| {
+                if requested {
+                    self.db.wal.global_checkpoint_candidate(0, 0)
+                } else {
+                    None
+                }
+            });
+        if let Some((disk_addr, page_id)) = candidate {
+            let mut guard = self
+                .lock_manager
+                .get_upgrade_or_acquire_write_lock(&self.db.map_table, page_id)?;
+            Self::ensure_mini_page(self.db, &mut guard)?;
+            guard.merge_to_disk(&self.db.cache, &self.db.io_engine);
+            self.db
+                .wal
+                .checkpoint_leaf(disk_addr)
+                .expect("failed to checkpoint WAL for candidate leaf");
+            self.db
+                .wal_checkpoint_requested
+                .store(false, Ordering::Release);
+        }
+        Ok(())
     }
 
     fn apply_leaf_split(
@@ -412,7 +641,7 @@ impl<'db> QuickStepTx<'db> {
             }
             self.db
                 .cache
-                .evict(&self.db.map_table, &self.db.io_engine)?;
+                .evict(&self.db.map_table, &self.db.io_engine, &self.db.wal)?;
         };
 
         let mut guard = unsafe { NodeMeta::init(self, new_mini_page, size, disk_addr) };
@@ -687,6 +916,17 @@ impl QuickStep {
         tx.commit();
         res
     }
+
+    pub fn debug_flush_leaf(&self, page_id: PageId) -> Result<(), QSError> {
+        let mut tx = self.tx();
+        let res = tx.debug_flush_leaf(page_id);
+        tx.commit();
+        res
+    }
+
+    pub fn debug_flush_root_leaf(&self) -> Result<(), QSError> {
+        self.debug_flush_leaf(PageId(0))
+    }
 }
 
 impl<'db> QuickStepTx<'db> {
@@ -772,6 +1012,7 @@ impl<'db> QuickStepTx<'db> {
             .lock_manager
             .get_upgrade_or_acquire_write_lock(&self.db.map_table, res.page)?;
         Self::ensure_mini_page(self.db, &mut page_guard)?;
+        let page_id = page_guard.page_id();
         let index = match page_guard.get_write_guard().node() {
             NodeRef::MiniPage(idx) => idx,
             NodeRef::Leaf(_) => unreachable!("mini page expected after promotion"),
@@ -781,10 +1022,35 @@ impl<'db> QuickStepTx<'db> {
         if !removed {
             return Ok(false);
         }
-        if meta.user_entry_count() <= AUTO_MERGE_MIN_ENTRIES {
-            self.try_auto_merge(page_guard.page_id())?;
+        let disk_addr = meta.leaf();
+        self.db
+            .wal
+            .append_tombstone(page_id, disk_addr, key)
+            .expect("failed to record delete in WAL");
+        let user_entries = meta.user_entry_count();
+        Self::maybe_checkpoint_leaf(self.db, &mut page_guard, disk_addr)?;
+        self.maybe_global_checkpoint()?;
+        if user_entries <= AUTO_MERGE_MIN_ENTRIES {
+            self.try_auto_merge(page_id)?;
         }
         Ok(true)
+    }
+
+    pub fn debug_flush_leaf(&mut self, page_id: PageId) -> Result<(), QSError> {
+        let mut guard = self
+            .lock_manager
+            .get_upgrade_or_acquire_write_lock(&self.db.map_table, page_id)?;
+        Self::ensure_mini_page(self.db, &mut guard)?;
+        let disk_addr = match guard.get_write_guard().node() {
+            NodeRef::MiniPage(idx) => unsafe { self.db.cache.get_meta_ref(idx) }.leaf(),
+            NodeRef::Leaf(addr) => addr,
+        };
+        guard.merge_to_disk(&self.db.cache, &self.db.io_engine);
+        self.db
+            .wal
+            .checkpoint_leaf(disk_addr)
+            .expect("failed to checkpoint WAL for flushed leaf");
+        Ok(())
     }
 
     fn first_user_key(&mut self, guard: &mut WriteGuardWrapper<'db>) -> Result<Vec<u8>, QSError> {

@@ -2,6 +2,29 @@
 
 # Coding History
 
+#### 2025-11-22 17:05 UTC [pending] [main]
+
+- `WalManager` now stores both put (`{page_id, disk_addr, key, value}`) and delete records, replaying them before the cache/map-table bootstrap when `QuickStep::new()` starts up; checkpoints remove entries per leaf after eviction or manual flush.
+- `QuickStepTx::put` appends WAL entries for every successful insert/update (including the post-split path), guaranteeing cached writes survive restarts even if the leaf never flushes.
+- Added `tests/quickstep_delete_persist.rs::wal_replays_puts_without_manual_flush`; executed alongside the delete persistence test via `cargo test quickstep_delete_persist` (plus `cargo test quickstep_merge` for regression coverage).
+- Documentation (detailed plan, README, changelog, coding history) now calls out the expanded WAL coverage and the new crash test.
+
+#### 2025-11-22 17:05 UTC [pending] [main]
+
+- Upgraded `WalManager` with per-leaf stats, total-record and byte tracking, plus a global checkpoint candidate API so the WAL can be pruned automatically when it exceeds configurable thresholds.
+- `QuickStepTx::put`/`delete` now call the new helper: per-leaf checkpoints run once a leaf accumulates enough dirty entries, and a background hook flushes the busiest leaf whenever the overall WAL load crosses either the record or byte threshold.
+- Added `QuickStepConfig::with_wal_thresholds(...)` so tests/deployments can tune the per-leaf and global thresholds without changing code, plus `QuickStep::debug_wal_stats` to surface WAL usage in tests. A lightweight background WAL monitor thread now raises checkpoint requests whenever the global limits are exceeded.
+- Added `tests/quickstep_delete_persist.rs::wal_replays_puts_without_manual_flush` and `wal_auto_checkpoint_trims_entries` to cover both crash replay and automatic pruning; re-ran `cargo test quickstep_delete_persist` and `cargo test quickstep_merge`.
+- Documentation (detailed plan, README, changelog, coding history) updated to describe the WAL pressure monitor and the new tests.
+
+#### 2025-11-22 16:25 UTC [pending] [main]
+
+- Added `WalManager` (length-prefixed binary log) plus `.wal` path wiring in `QuickStep::new`; deletes now append `{page_id, disk_addr, key}` records with fsync-before-return semantics and the startup path replays any pending tombstones before truncating the log.
+- Taught `MiniPageBuffer::evict` and `QuickStep::debug_flush_leaf` to checkpoint the WAL per leaf once dirty pages hit disk, ensuring the log only retains un-flushed deletes.
+- `QuickStepTx::delete` records WAL entries immediately after marking tombstones, while `QuickStep::debug_flush_root_leaf` exposes a test hook for forcing checkpoints.
+- Tests: `tests/quickstep_delete_persist.rs` gained `wal_replays_deletes_without_manual_flush`; re-ran `cargo test quickstep_delete_persist` and `cargo test quickstep_merge`.
+- Documentation: design plan, README status table, changelog, and coding history describe the minimal WAL/checkpoint flow and the new crash-replay coverage.
+
 #### 2025-11-22 15:40 UTC [pending] [main]
 
 - Added tombstone-aware delete support: `NodeMeta` can mark entries as tombstones, `flush_dirty_entries` removes them from disk on eviction, and `QuickStep::delete` now relies on tombstones plus auto-merge thresholds rather than immediate physical removal.

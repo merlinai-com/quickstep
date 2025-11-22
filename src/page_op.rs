@@ -174,7 +174,7 @@ pub fn flush_dirty_entries(node_meta: &mut NodeMeta, io_engine: &IoEngine) {
                 let mut key = Vec::with_capacity(prefix.len() + suffix.len());
                 key.extend_from_slice(prefix);
                 key.extend_from_slice(suffix);
-                entry.as_mut().remove_key(&key);
+                entry.as_mut().remove_key_physical(&key);
                 tombstones.push(i);
             }
             typ if typ.is_dirty() => {
