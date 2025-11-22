@@ -2,6 +2,20 @@
 
 # Coding History
 
+#### 2025-11-22 13:05 UTC [pending] [main]
+
+- Added split instrumentation in `src/debug.rs` (`SplitEvent` log + `debug::split_events()`) and rewired `QuickStepTx::put` to record the logical left/right page IDs whenever a leaf split completes.
+- Strengthened `tests/quickstep_split.rs`: padded keys for lexicographic ordering, asserted the first split touched page 0, and introduced `second_split_under_root_adds_third_child` to prove parent insertion rebuilds the root with three children once its right child splits again.
+- Documentation updates: `design/detailed-plan.md` now marks instrumentation + both split tests complete, `design/roadmap.md` notes that root-level splits are covered by instrumentation-backed tests, and `README.md` calls out the new coverage in the status table.
+- Tests: `cargo test quickstep_split` (PASS, existing warnings remain in unfinished modules).
+
+#### 2025-11-22 13:40 UTC [pending] [main]
+
+- Added `QuickStep::debug_leaf_snapshot` + `DebugLeafSnapshot` so integration tests can materialise the user keys for any leaf (mini-page or on-disk) under the current lock manager; this closes the loop between structural split checks and actual key ranges.
+- Tightened `tests/quickstep_split.rs`: split events are now matched to the root’s child list, and the new leaf snapshots assert that every pivot cleanly partitions the key space (left < pivot ≤ right, etc.) after the first and second splits.
+- Updated `design/detailed-plan.md` (Phase 1.3 Testing/Parent bullets) to capture the new helper + stronger assertions.
+- Tests: `cargo test quickstep_split`.
+
 #### 2025-11-22 10:45 UTC [pending] [main]
 
 - Formatted the on-disk root leaf during `QuickStep::new()` so page 0 always contains the sentinel fence keys before any transaction runs; promotion now copies the disk image verbatim into a mini-page and simply re-points the map-table entry.

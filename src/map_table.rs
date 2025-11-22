@@ -181,8 +181,14 @@ impl MapTable {
 }
 
 /// An id of a leaf page, representing an index into the mapping table
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub struct PageId(pub(crate) u64);
+
+impl PageId {
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
 
 pub struct PageReadGuard<'a> {
     map_table: &'a MapTable,

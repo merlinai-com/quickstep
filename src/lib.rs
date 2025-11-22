@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    btree::{BPTree, OpType},
+    btree::{BPTree, DebugLeafParent, OpType},
     buffer::{MiniPageBuffer, MiniPageIndex},
     error::QSError,
     io_engine::IoEngine,
@@ -49,6 +49,12 @@ pub struct QuickStep {
     io_engine: IoEngine,
     /// The map from page ids to their location, either in the mini-page buffer or on disk
     map_table: MapTable,
+}
+
+#[derive(Debug)]
+pub struct DebugLeafSnapshot {
+    pub page_id: PageId,
+    pub keys: Vec<Vec<u8>>,
 }
 
 /// Config to create a new QuickStep instance
@@ -135,6 +141,36 @@ impl QuickStep {
         }
         self.io_engine.write_page(0, &leaf);
     }
+
+    /// Test helper to inspect the root after splits; not intended for production use.
+    pub fn debug_root_leaf_parent(&self) -> Option<DebugLeafParent> {
+        self.inner_nodes.debug_root_leaf_parent()
+    }
+
+    /// Test helper: materialises the user keys stored in the specified leaf page.
+    /// This acquires a transient read lock on the map table entry and copies the keys,
+    /// so it is safe to drop immediately after use in tests.
+    pub fn debug_leaf_snapshot(&self, page_id: PageId) -> Result<DebugLeafSnapshot, QSError> {
+        let guard = self.map_table.read_page_entry(page_id)?;
+        let snapshot = match guard.node() {
+            NodeRef::MiniPage(index) => {
+                let meta = unsafe { self.cache.get_meta_ref(index) };
+                DebugLeafSnapshot {
+                    page_id,
+                    keys: collect_user_keys(meta),
+                }
+            }
+            NodeRef::Leaf(disk_addr) => {
+                let disk_leaf = self.io_engine.get_page(disk_addr);
+                let meta = disk_leaf.as_ref();
+                DebugLeafSnapshot {
+                    page_id,
+                    keys: collect_user_keys(meta),
+                }
+            }
+        };
+        Ok(snapshot)
+    }
 }
 
 pub struct QuickStepTx<'db> {
@@ -171,7 +207,6 @@ impl<'db> QuickStepTx<'db> {
         match Self::try_put_with_promotion(self.db, &mut page_guard, key, val)? {
             TryPutResult::Success => return Ok(()),
             TryPutResult::NeedsSplit => {
-                debug::record_split_request();
                 // We know which locks we need, so try to acquire them, if we fail then it might
                 // be because another thread modified the tree which we weren't looking, so we should restart
                 let split_plan = Self::plan_leaf_split(self.db, &mut page_guard);
@@ -194,6 +229,8 @@ impl<'db> QuickStepTx<'db> {
                     &mut right_guard,
                     &split_plan,
                 )?;
+
+                debug::record_split_event(page_guard.page_id().0, right_guard.page_id().0);
 
                 if let Some(parent_guard) = lock_bundle.chain.last_mut() {
                     match parent_guard.as_mut().insert_leaf_entry_after_child(
@@ -360,4 +397,17 @@ impl<'db> QuickStepTx<'db> {
 
         guard
     }
+}
+
+fn collect_user_keys(meta: &NodeMeta) -> Vec<Vec<u8>> {
+    let prefix = meta.get_node_prefix();
+    meta.entries()
+        .filter(|entry| !entry.meta.fence())
+        .map(|entry| {
+            let mut key = Vec::with_capacity(prefix.len() + entry.key_suffix.len());
+            key.extend_from_slice(prefix);
+            key.extend_from_slice(entry.key_suffix);
+            key
+        })
+        .collect()
 }

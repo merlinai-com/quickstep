@@ -20,7 +20,7 @@
 |-----|------|----------|-------|
 | 1.1 | Implement `QuickStep::new()` | ✅ | Wire up BPTree, buffer, map table, IO |
 | 1.2 | Finish `put()` happy path | ✅ | Handle mini-page allocation/write, no splitting |
-| 1.3 | Implement split/merge logic | WIP | Requires lock escalation + map table updates (coordinate with Raphael where possible) |
+| 1.3 | Implement split/merge logic | WIP | Root-level leaf splits + parent rebuild path implemented with debug instrumentation and tests; cascading inner splits + map-table propagation still pending |
 | 1.4 | Complete `get()` fence key handling |  | Lower/upper fence construction |
 | 1.5 | Implement `abort`/`commit` on `QuickStepTx` |  | Track changes for rollback |
 

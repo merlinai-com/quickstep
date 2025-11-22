@@ -1,5 +1,24 @@
 # Changelog
 
+#### 2025-11-22 13:05 UTC [pending] [main]
+
+##### Phase 1.3 split instrumentation + depth-1 cascading test
+
+- Added `debug::SplitEvent` logging so every successful leaf split records the logical left/right page IDs; `debug::split_events()` now complements the counter and lets tests assert which leaf actually split.
+- `QuickStepTx::put` logs split events after applying the split plan, ensuring instrumentation captures the final page IDs even when parent updates follow.
+- Extended `tests/quickstep_split.rs`: padded keys to preserve lexical ordering, asserted the first split always touches page 0, and introduced `second_split_under_root_adds_third_child` to confirm the root parent rebuilds itself with three children after a second split under the same inner node.
+- Docs: `design/detailed-plan.md` now marks the instrumentation + second split scenario as complete, `design/roadmap.md` highlights the new coverage, and the README status table mentions the instrumentation-backed tests.
+- Tests: `cargo test quickstep_split`.
+
+#### 2025-11-22 13:40 UTC [pending] [main]
+
+##### Phase 1.3 leaf snapshots + pivot-range assertions
+
+- Added `QuickStep::debug_leaf_snapshot`/`DebugLeafSnapshot` so tests can materialise the exact user keys resident in any leaf (either cached or still on disk) via the existing map-table locks.
+- Strengthened `tests/quickstep_split.rs`: each split event is matched to the root’s current child list, and the new snapshots assert that every pivot cleanly partitions the key ranges (left < pivot ≤ right) after the first and second splits.
+- Updated `design/detailed-plan.md` Testing/Parent sections to call out the new helper + data validation step.
+- Tests: `cargo test quickstep_split`.
+
 #### 2025-11-22 10:45 UTC [pending] [main]
 
 ##### Phase 1.3 bootstrap hardening + node fixes

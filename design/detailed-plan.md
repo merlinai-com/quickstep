@@ -71,7 +71,7 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
 
 1. **Pre-flight checks**
    - ✅ Added a debug assertion in `promote_leaf_to_mini_page` to guarantee every on-disk leaf we copy already contains at least the two required fence keys. This confirms the initial disk formatting assumptions before we start moving records around.
-   - TODO: Add lightweight instrumentation (feature-gated) so tests can assert how often `TryPutResult::NeedsSplit` is triggered and which page IDs are involved.
+   - ✅ Added lightweight split instrumentation (`debug::split_events`) that records both the original page ID and the freshly allocated sibling each time `TryPutResult::NeedsSplit` is resolved; integration tests can now assert exact split locations.
 
 2. **Implementation plan**
    1. Extend `NodeMeta` helpers:
@@ -91,13 +91,20 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
       - ✅ Added a temporary parent-insert path for level-1 inner nodes: we collect the root’s `(key, child)` entries, insert the new pivot/right-child pair, and rebuild the node in place. This unblocks non-root leaf splits while we design cascading inner splits.
       - 🔜 For deeper trees, replace the rebuild helper with an incremental insert + cascading split flow so we can bubble splits up the inner levels.
       - 🔜 Update `MapTable` + `NodeRef` bookkeeping so the new right leaf becomes reachable immediately after the left leaf is rebuilt.
+      - ✅ Added a test-only `debug_root_leaf_parent` hook (exposed via `QuickStep`) so integration tests can inspect root fan-out/pivots after a split.
+      - ✅ Added `QuickStep::debug_leaf_snapshot`, a read-only helper that materialises the user keys for any leaf page (cached mini-page or on-disk leaf) so tests can assert exact key ranges per child.
 
 3. **Testing**
-   - Extend `tests/quickstep_put_basic.rs` (or add `tests/quickstep_split.rs`) to insert enough keys to trigger a split, then:
-     1. Assert that all keys are still readable.
-     2. Assert that the parent/root now references two leaves (via a test-only debug hook exposing the current root structure).
-     3. Confirm via instrumentation counters that exactly one split occurred.
-   - Add negative test ensuring that after the split, inserting additional keys routes to the correct leaf.
+   - ✅ Added `tests/quickstep_split.rs::root_split_occurs_and_is_readable`:
+     1. Inserts large payloads until the first split occurs, asserting `debug::split_requests() == 1`.
+     2. Uses `debug_root_leaf_parent()` to verify the root now has two children and the recorded pivot matches the inserted key distribution.
+     3. Runs a fresh transaction that reads back every inserted key to ensure routing follows the new pivot.
+   - ✅ Added `tests/quickstep_split.rs::second_split_under_root_adds_third_child`:
+     1. Fills the tree until the second split fires under the promoted root, ensuring parent insertion rebuilds the inner node with three children.
+     2. Asserts the split log recorded distinct left-page IDs for the first and second splits (page 0 vs the right child) and that `debug_root_leaf_parent()` now shows three children / two pivots.
+     3. Re-reads every inserted key to prove the new routing logic is stable.
+   - ✅ Split instrumentation is now exposed via `debug::split_events()` so future cascading tests can assert exactly which logical leaf split; additional scenarios can build atop this without new hooks.
+   - ✅ Leaf snapshots + pivot assertions now verify that every child’s key range is consistent with the recorded pivots after each split, closing the gap between structural and data validation.
 
 4. **Open questions**
    - ✅ Resolved 22 Nov 2025: `QuickStep::new` now formats page 0 on disk (header + sentinel fence keys) before bootstrapping the map table, and every subsequent mini-page allocation calls `ensure_fence_keys` so promotion no longer needs a bootstrap path.

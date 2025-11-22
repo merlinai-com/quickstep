@@ -82,7 +82,7 @@ cargo doc --open
 ### ⚠️ Partially Implemented
 
 - Put/get operations (mini-page promotion + cache writes are in place; leaf splits/parent updates are still being completed)
-- Leaf split logic (Phase 1.3 implementation and tests in progress)
+- Leaf split logic (Phase 1.3 root splits + parent rebuild path now have instrumentation-backed integration tests; cascading inner splits remain in flight)
 - Buffer eviction (structure present, merge-to-disk incomplete)
 - I/O engine (read/write path works; metadata/WAL integration still TBD)
 
