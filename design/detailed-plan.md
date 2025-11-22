@@ -65,3 +65,38 @@ This document tracks the step-by-step work for each Phase 1 task. For now it cov
 
 Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
 
+---
+
+## 1.3 – Leaf splits (In progress)
+
+1. **Pre-flight checks**
+   - ✅ Added a debug assertion in `promote_leaf_to_mini_page` to guarantee every on-disk leaf we copy already contains at least the two required fence keys. This confirms the initial disk formatting assumptions before we start moving records around.
+   - TODO: Add lightweight instrumentation (feature-gated) so tests can assert how often `TryPutResult::NeedsSplit` is triggered and which page IDs are involved.
+
+2. **Implementation plan**
+   1. Extend `NodeMeta` helpers:
+      - ✅ Added record-count setters plus `inc_record_count` / `dec_record_count`.
+      - ✅ Added `LeafEntryIter` iterator to yield `(KVMeta, key_suffix, value)` triples without duplicating pointer arithmetic.
+      - 🔜 Add a `reset_contents()` + `replay_entries()` pair so the left-hand mini-page can be zeroed and repopulated via the existing insertion path (no bespoke serializer). This is the first actionable task before we touch the split flow again.
+   2. Build/apply the split helper:
+      - ✅ Implemented `LeafSplitPlan::from_node` (reads the existing mini-page, identifies pivot key, and prepares owned `(key, value)` pairs for the right-hand page).
+      - 🔜 Implement `LeafSplitPlan::apply`:
+        * Input: the plan above, a mutable reference to the original (left) mini-page, and a freshly allocated right-hand mini-page (`NodeMeta`).
+        * Steps: wipe the left page, replay only the retained entries, populate the right page from the owned `(key, value)` pairs, and expose the separator key.
+        * Result: Two valid leaves, plus a `LeafSplitOutcome` struct carrying the pivot key and child page IDs for the parent update.
+   3. Parent/root updates:
+      - 🔜 Teach `BPTree` a `promote_leaf_root` helper that installs a minimal inner node with two children when the current root splits.
+      - 🔜 For non-root leaves, plumb a `ParentInsert` struct that captures the separator key + right child ID and hands it to the (future) inner-node insert path. Inner splits can stay `todo!()` if we clearly mark the missing recursive step.
+      - 🔜 Update `MapTable` + `NodeRef` bookkeeping so the new right leaf becomes reachable immediately after the left leaf is rebuilt.
+
+3. **Testing**
+   - Extend `tests/quickstep_put_basic.rs` (or add `tests/quickstep_split.rs`) to insert enough keys to trigger a split, then:
+     1. Assert that all keys are still readable.
+     2. Assert that the parent/root now references two leaves (via a test-only debug hook exposing the current root structure).
+     3. Confirm via instrumentation counters that exactly one split occurred.
+   - Add negative test ensuring that after the split, inserting additional keys routes to the correct leaf.
+
+4. **Open questions**
+   - Need to confirm the expected initial fence-key layout for brand-new leaves (currently inferred via debug assertion). If the format differs from Raphael’s reference implementation, we may need to add an explicit “format_leaf” step during bootstrap.
+   - Inner-node serialization helpers are not implemented yet (`BPNode` currently only supports searching). We will implement just enough (key insertion + child pointer storage) for the root case in this phase.
+

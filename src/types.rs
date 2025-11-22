@@ -266,8 +266,42 @@ impl NodeMeta {
     }
 
     #[inline]
+    pub fn set_record_count(&mut self, count: u16) {
+        const RECORD_COUNT_MASK: u64 = 0x0000_0000_0000_01FF;
+        self.0 &= !RECORD_COUNT_MASK;
+        self.0 |= (count as u64) & RECORD_COUNT_MASK;
+    }
+
+    #[inline]
+    pub fn inc_record_count(&mut self) {
+        let next = self
+            .record_count()
+            .checked_add(1)
+            .expect("record count overflow");
+        self.set_record_count(next);
+    }
+
+    #[inline]
+    pub fn dec_record_count(&mut self) {
+        let next = self
+            .record_count()
+            .checked_sub(1)
+            .expect("record count underflow");
+        self.set_record_count(next);
+    }
+
+    #[inline]
     pub fn page_id(&self) -> PageId {
         PageId(self.1 >> 16)
+    }
+
+    #[inline]
+    pub fn entries(&self) -> LeafEntryIter<'_> {
+        LeafEntryIter {
+            node: self,
+            idx: 0,
+            end: self.record_count() as usize,
+        }
     }
 }
 
@@ -278,4 +312,35 @@ impl NodeMeta {
 pub enum NodeRef<'g> {
     Leaf(u64),
     MiniPage(MiniPageIndex<'g>),
+}
+
+pub struct LeafEntry<'a> {
+    pub meta: KVMeta,
+    pub key_suffix: &'a [u8],
+    pub value: &'a [u8],
+}
+
+pub struct LeafEntryIter<'a> {
+    node: &'a NodeMeta,
+    idx: usize,
+    end: usize,
+}
+
+impl<'a> Iterator for LeafEntryIter<'a> {
+    type Item = LeafEntry<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.idx >= self.end {
+            return None;
+        }
+
+        let meta = self.node.get_kv_meta(self.idx);
+        self.idx += 1;
+
+        Some(LeafEntry {
+            meta,
+            key_suffix: self.node.get_stored_key_from_meta(meta),
+            value: self.node.get_val_from_meta(meta),
+        })
+    }
 }

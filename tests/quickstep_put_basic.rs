@@ -1,4 +1,4 @@
-use quickstep::{QuickStep, QuickStepConfig};
+use quickstep::{debug, QuickStep, QuickStepConfig};
 use tempfile::TempDir;
 
 fn new_db() -> QuickStep {
@@ -9,6 +9,7 @@ fn new_db() -> QuickStep {
 
 #[test]
 fn insert_and_read_back() {
+    debug::reset_debug_counters();
     let db = new_db();
 
     {
@@ -27,4 +28,10 @@ fn insert_and_read_back() {
         assert_eq!(tx.get(b"delta").unwrap(), None);
         tx.commit();
     }
+
+    assert_eq!(
+        debug::split_requests(),
+        0,
+        "happy-path insert should not request a split"
+    );
 }

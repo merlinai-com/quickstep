@@ -42,7 +42,7 @@ Each subsection lists three things:
   2. Start a transaction → first `put` should force promotion from disk leaf to cache → insert 3–5 short keys → `commit`.
   3. New transaction → `get` each key → assert equality.
   4. Optionally call `tx().get()` for a missing key to confirm `None`.
-- Instrumentation: add a debug hook (feature-gated) to assert `TryPutResult::NeedsSplit` is never returned during this test and that exactly one promotion occurred.
+- Instrumentation: `debug::record_split_request` now tracks every time `TryPutResult::NeedsSplit` fires; the test resets the counter and asserts it stays at zero to ensure the happy path never reaches the split logic.
 
 ### Current results
 - Command: `cargo fmt && cargo test quickstep_new_smoke` (this run also executes `tests/quickstep_put_basic`).

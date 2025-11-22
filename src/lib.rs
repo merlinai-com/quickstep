@@ -19,12 +19,13 @@ use crate::{
     lock_manager::{LockManager, PageGuard, WriteGuardWrapper},
     map_table::{MapTable, PageReadGuard},
     node::InsufficientSpace,
-    page_op::TryPutResult,
-    types::{NodeMeta, NodeSize},
+    page_op::{LeafSplitPlan, TryPutResult},
+    types::{NodeMeta, NodeRef, NodeSize},
 };
 
 pub mod btree;
 pub mod buffer;
+pub mod debug;
 pub mod error;
 pub mod io_engine;
 pub mod lock_manager;
@@ -155,8 +156,11 @@ impl<'db> QuickStepTx<'db> {
         match Self::try_put_with_promotion(self.db, &mut page_guard, key, val)? {
             TryPutResult::Success => return Ok(()),
             TryPutResult::NeedsSplit => {
+                debug::record_split_request();
                 // We know which locks we need, so try to acquire them, if we fail then it might
                 // be because another thread modified the tree which we weren't looking, so we should restart
+                let split_plan = Self::plan_leaf_split(self.db, &mut page_guard);
+
                 let _locks = self
                     .db
                     .inner_nodes
@@ -164,7 +168,10 @@ impl<'db> QuickStepTx<'db> {
 
                 let _new_guard = self.new_mini_page(NodeSize::LeafPage, None);
 
-                todo!("leaf splitting is not yet implemented");
+                todo!(
+                    "leaf splitting is not yet implemented. planned pivot={:?}",
+                    split_plan.pivot_key
+                );
             }
             TryPutResult::NeedsPromotion(_) => unreachable!("promotion handled before returning"),
         }
@@ -184,6 +191,20 @@ fn resolve_data_path(path: &Path) -> PathBuf {
 }
 
 impl<'db> QuickStepTx<'db> {
+    fn plan_leaf_split(
+        db: &'db QuickStep,
+        page_guard: &mut WriteGuardWrapper<'_, 'db>,
+    ) -> LeafSplitPlan {
+        let write_guard = page_guard.get_write_guard();
+        match write_guard.node() {
+            NodeRef::MiniPage(idx) => {
+                let node_meta = unsafe { db.cache.get_meta_ref(idx) };
+                LeafSplitPlan::from_node(node_meta)
+            }
+            NodeRef::Leaf(_) => unreachable!("leaf splits only apply to cached mini-pages"),
+        }
+    }
+
     fn try_put_with_promotion<'guard>(
         db: &'db QuickStep,
         page_guard: &mut WriteGuardWrapper<'guard, 'db>,
@@ -206,6 +227,11 @@ impl<'db> QuickStepTx<'db> {
         disk_addr: u64,
     ) -> Result<(), QSError> {
         let disk_leaf = page_guard.load_leaf(&db.io_engine, disk_addr)?;
+        debug_assert!(
+            disk_leaf.as_ref().record_count() >= 2,
+            "Leaf page {} missing fence keys; initialization incomplete",
+            disk_addr
+        );
         let cache_index = db
             .cache
             .alloc(NodeSize::LeafPage)

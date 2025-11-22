@@ -1,9 +1,75 @@
+use crate::buffer::MiniPageBuffer;
 use crate::error::QSError;
 use crate::io_engine::{DiskLeaf, IoEngine};
 use crate::lock_manager::{GuardWrapper, PageGuard, WriteGuardWrapper};
 use crate::node::InsufficientSpace;
-use crate::types::{NodeMeta, NodeSize};
-use crate::{buffer::MiniPageBuffer, types::NodeRef};
+use crate::types::{NodeMeta, NodeRef, NodeSize};
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct LeafSplitPlan {
+    pub prefix: Vec<u8>,
+    pub pivot_key: Vec<u8>,
+    pub retain_count: usize,
+    pub move_entries: Vec<LeafEntryOwned>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct LeafEntryOwned {
+    pub key: Vec<u8>,
+    pub value: Vec<u8>,
+}
+
+#[allow(dead_code)]
+impl LeafSplitPlan {
+    pub fn from_node(meta: &NodeMeta) -> LeafSplitPlan {
+        let prefix = meta.get_node_prefix();
+        let mut prefix_buf = Vec::with_capacity(prefix.len());
+        prefix_buf.extend_from_slice(prefix);
+
+        let mut live_entries = Vec::new();
+
+        for entry in meta.entries() {
+            if entry.meta.fence() {
+                continue;
+            }
+            live_entries.push(entry);
+        }
+
+        assert!(
+            !live_entries.is_empty(),
+            "Leaf must contain at least one non-fence entry for a split"
+        );
+
+        let move_start = live_entries.len() / 2;
+        let pivot_entry = &live_entries[move_start];
+
+        let mut pivot_key = Vec::with_capacity(prefix.len() + pivot_entry.key_suffix.len());
+        pivot_key.extend_from_slice(prefix);
+        pivot_key.extend_from_slice(pivot_entry.key_suffix);
+
+        let move_entries = live_entries[move_start..]
+            .iter()
+            .map(|entry| {
+                let mut key = Vec::with_capacity(prefix.len() + entry.key_suffix.len());
+                key.extend_from_slice(prefix);
+                key.extend_from_slice(entry.key_suffix);
+                LeafEntryOwned {
+                    key,
+                    value: entry.value.to_vec(),
+                }
+            })
+            .collect();
+
+        LeafSplitPlan {
+            prefix: prefix_buf,
+            pivot_key,
+            retain_count: move_start,
+            move_entries,
+        }
+    }
+}
 
 impl<'a> PageGuard<'a> {
     pub fn get<'g>(
