@@ -24,7 +24,8 @@
 ##### Phase 1.3 post-split routing test
 
 - Added `tests/quickstep_split.rs::post_split_inserts_route_to_expected_children`, which inserts fresh keys on either side of the recorded pivot after the first split and proves (via `debug_leaf_snapshot`) that they land in the expected child without triggering another split.
-- Documented the new negative-routing coverage in `design/detailed-plan.md`.
+- Instrumentation: `debug::SplitEvent` now carries the pivot key plus `(left_count, right_count)` so tests can cross-check the recorded metadata against actual leaf contents at split time.
+- Documented the new negative-routing coverage + richer instrumentation in `design/detailed-plan.md`.
 - Tests: `cargo test quickstep_split`.
 
 #### 2025-11-22 10:45 UTC [pending] [main]

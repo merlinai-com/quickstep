@@ -58,12 +58,27 @@ fn root_split_occurs_and_is_readable() {
         "right child should match recorded split sibling"
     );
     let pivot = snapshot.pivots[0].clone();
+    assert_eq!(
+        events[0].pivot_key,
+        pivot,
+        "instrumented pivot should match the root pivot"
+    );
     let left_snapshot = db
         .debug_leaf_snapshot(snapshot.children[0])
         .expect("left child snapshot");
     let right_snapshot = db
         .debug_leaf_snapshot(snapshot.children[1])
         .expect("right child snapshot");
+    assert_eq!(
+        events[0].left_count,
+        left_snapshot.keys.len(),
+        "instrumented left_count should match snapshot"
+    );
+    assert_eq!(
+        events[0].right_count,
+        right_snapshot.keys.len(),
+        "instrumented right_count should match snapshot"
+    );
     assert!(
         left_snapshot
             .keys
@@ -110,11 +125,9 @@ fn post_split_inserts_route_to_expected_children() {
     }
 
     assert_eq!(debug::split_requests(), 1);
-    let snapshot = db
-        .debug_root_leaf_parent()
-        .expect("root should have been promoted");
-    let pivot = snapshot.pivots[0].clone();
-    let pivot_idx = parse_key_index(&pivot);
+    let events = debug::split_events();
+    assert_eq!(events.len(), 1, "expected single split event");
+    let pivot_idx = parse_key_index(&events[0].pivot_key);
     assert!(
         pivot_idx > 0,
         "split pivot must be greater than zero for range tests"
@@ -255,6 +268,16 @@ fn second_split_under_root_adds_third_child() {
 
     let low_pivot = snapshot.pivots[0].clone();
     let high_pivot = snapshot.pivots[1].clone();
+    assert_eq!(
+        events[0].pivot_key,
+        low_pivot,
+        "first split pivot should match snapshot"
+    );
+    assert_eq!(
+        events[1].pivot_key,
+        high_pivot,
+        "second split pivot should match snapshot"
+    );
     let left_snapshot = db
         .debug_leaf_snapshot(snapshot.children[0])
         .expect("left snapshot");
@@ -264,6 +287,26 @@ fn second_split_under_root_adds_third_child() {
     let right_snapshot = db
         .debug_leaf_snapshot(snapshot.children[2])
         .expect("right snapshot");
+    assert_eq!(
+        events[0].left_count,
+        left_snapshot.keys.len(),
+        "first split left_count should match left snapshot"
+    );
+    assert_eq!(
+        events[0].right_count,
+        middle_snapshot.keys.len(),
+        "first split right_count should match middle snapshot"
+    );
+    assert_eq!(
+        events[1].left_count,
+        middle_snapshot.keys.len(),
+        "second split left_count should match middle snapshot"
+    );
+    assert_eq!(
+        events[1].right_count,
+        right_snapshot.keys.len(),
+        "second split right_count should match right snapshot"
+    );
     assert!(
         left_snapshot
             .keys

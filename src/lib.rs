@@ -230,7 +230,13 @@ impl<'db> QuickStepTx<'db> {
                     &split_plan,
                 )?;
 
-                debug::record_split_event(page_guard.page_id().0, right_guard.page_id().0);
+                debug::record_split_event(
+                    page_guard.page_id().0,
+                    right_guard.page_id().0,
+                    split_outcome.pivot_key.clone(),
+                    split_outcome.left_count,
+                    split_outcome.right_count,
+                );
 
                 if let Some(parent_guard) = lock_bundle.chain.last_mut() {
                     match parent_guard.as_mut().insert_leaf_entry_after_child(

@@ -19,7 +19,8 @@
 #### 2025-11-22 13:55 UTC [pending] [main]
 
 - Added `tests/quickstep_split.rs::post_split_inserts_route_to_expected_children`, which inserts new keys on both sides of the recorded pivot after the first split and proves (via `debug_leaf_snapshot`) that they land in the expected leaf without triggering extra splits.
-- Documented the new routing test in `design/detailed-plan.md`.
+- Instrumentation upgrade: `debug::split_events()` now records the pivot key plus `(left_count, right_count)` so tests can cross-check the recorded metadata against real leaf contents.
+- Documented the new routing test + instrumentation in `design/detailed-plan.md`.
 - Tests: `cargo test quickstep_split`.
 
 #### 2025-11-22 10:45 UTC [pending] [main]
