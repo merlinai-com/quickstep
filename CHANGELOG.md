@@ -6,6 +6,33 @@
 
 # Changelog
 
+#### 2025-11-22 17:35 UTC [pending] [main]
+
+##### Phase 1.3 sentinel fence audit
+
+- Added `QuickStep::debug_leaf_fences` plus a helper to extract the lower/upper fence bytes from any leaf (mini-page or on-disk), exposing the disk address alongside the fence keys for debug assertions.
+- Extended `map_table::PageId` with `from_u64` so tests can reference concrete page IDs (e.g., the root) without reaching into crate-private internals.
+- `tests/quickstep_fence_keys.rs` now covers four scenarios: page 0 at bootstrap, the two children created by the first root split, manual leaf merges via `debug_merge_leaves`, and eviction-driven flushes in the tiny-cache configuration; executed via `cargo test quickstep_fence_keys`.
+- Updated the detailed plan and README status table to note the fence instrumentation/coverage.
+
+#### 2025-11-22 17:25 UTC [pending] [main]
+
+##### Phase 1.3 WAL CLI overrides
+
+- `QuickStepConfig::with_cli_overrides` now parses `--quickstep-wal-leaf-threshold`, `--quickstep-wal-global-record-threshold`, and `--quickstep-wal-global-byte-threshold` flags (either `--flag=VALUE` or `--flag VALUE`) so deployments can tune checkpoint policy via command-line args in addition to env vars and builder overrides.
+- `QuickStep::new` automatically applies both env and CLI overrides before wiring up the tree/cache, ensuring every call path honours runtime configuration without extra boilerplate.
+- Extended `tests/quickstep_config_env.rs` with CLI coverage for equals/space syntax plus invalid input fallbacks; executed via `cargo test quickstep_config_env`.
+- Documentation (detailed plan, README) updated to describe the new CLI flags and how they interact with the existing configuration helpers.
+
+#### 2025-11-22 17:15 UTC [pending] [main]
+
+##### Phase 1.3 WAL threshold env overrides
+
+- `QuickStepConfig::with_env_overrides` now honors `QUICKSTEP_WAL_LEAF_THRESHOLD`, `QUICKSTEP_WAL_GLOBAL_RECORD_THRESHOLD`, and `QUICKSTEP_WAL_GLOBAL_BYTE_THRESHOLD`, letting operators tune checkpoint policy without code changes.
+- `QuickStep::new` automatically applies the overrides before instantiating the cache/tree, so every caller (tests included) picks up deployment-specific thresholds transparently.
+- Added `tests/quickstep_config_env.rs` to cover both valid overrides and invalid inputs that fall back to defaults; ran `cargo test quickstep_config_env`.
+- Documentation (`design/detailed-plan.md`, README) now lists the new env vars, and this changelog plus coding history include the testing notes.
+
 #### 2025-11-22 17:05 UTC [pending] [main]
 
 ##### Phase 1.3 WAL puts + crash tests

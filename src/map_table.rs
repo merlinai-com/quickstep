@@ -188,6 +188,10 @@ impl PageId {
     pub fn as_u64(&self) -> u64 {
         self.0
     }
+
+    pub fn from_u64(id: u64) -> PageId {
+        PageId(id)
+    }
 }
 
 pub struct PageReadGuard<'a> {

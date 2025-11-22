@@ -7,6 +7,7 @@
 //! [design documentation](../design/).
 
 use std::{
+    env,
     path::{Path, PathBuf},
     ptr,
     sync::{
@@ -71,12 +72,26 @@ const AUTO_MERGE_MIN_ENTRIES: usize = 3;
 const DEFAULT_WAL_LEAF_CHECKPOINT_THRESHOLD: usize = 32;
 const DEFAULT_WAL_GLOBAL_RECORD_THRESHOLD: usize = 1024;
 const DEFAULT_WAL_GLOBAL_BYTE_THRESHOLD: usize = 512 * 1024;
+const ENV_WAL_LEAF_THRESHOLD: &str = "QUICKSTEP_WAL_LEAF_THRESHOLD";
+const ENV_WAL_GLOBAL_RECORD_THRESHOLD: &str = "QUICKSTEP_WAL_GLOBAL_RECORD_THRESHOLD";
+const ENV_WAL_GLOBAL_BYTE_THRESHOLD: &str = "QUICKSTEP_WAL_GLOBAL_BYTE_THRESHOLD";
+const CLI_WAL_LEAF_THRESHOLD: &str = "--quickstep-wal-leaf-threshold";
+const CLI_WAL_GLOBAL_RECORD_THRESHOLD: &str = "--quickstep-wal-global-record-threshold";
+const CLI_WAL_GLOBAL_BYTE_THRESHOLD: &str = "--quickstep-wal-global-byte-threshold";
 
 #[derive(Debug)]
 pub struct DebugLeafSnapshot {
     pub page_id: PageId,
     pub disk_addr: u64,
     pub keys: Vec<Vec<u8>>,
+}
+
+#[derive(Debug)]
+pub struct DebugLeafFences {
+    pub page_id: PageId,
+    pub disk_addr: u64,
+    pub lower: Vec<u8>,
+    pub upper: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -123,6 +138,47 @@ impl QuickStepConfig {
         }
     }
 
+    pub fn with_env_overrides(mut self) -> QuickStepConfig {
+        if let Some(val) = read_env_usize(ENV_WAL_LEAF_THRESHOLD) {
+            self.wal_leaf_checkpoint_threshold = val;
+        }
+        if let Some(val) = read_env_usize(ENV_WAL_GLOBAL_RECORD_THRESHOLD) {
+            self.wal_global_record_threshold = val;
+        }
+        if let Some(val) = read_env_usize(ENV_WAL_GLOBAL_BYTE_THRESHOLD) {
+            self.wal_global_byte_threshold = val;
+        }
+        self
+    }
+
+    pub fn with_cli_overrides<I, S>(mut self, args: I) -> QuickStepConfig
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let mut iter = args.into_iter();
+        while let Some(arg) = iter.next() {
+            let token: String = arg.into();
+            if let Some(value) = parse_cli_override(&token, CLI_WAL_LEAF_THRESHOLD, &mut iter) {
+                self.wal_leaf_checkpoint_threshold = value;
+                continue;
+            }
+            if let Some(value) =
+                parse_cli_override(&token, CLI_WAL_GLOBAL_RECORD_THRESHOLD, &mut iter)
+            {
+                self.wal_global_record_threshold = value;
+                continue;
+            }
+            if let Some(value) =
+                parse_cli_override(&token, CLI_WAL_GLOBAL_BYTE_THRESHOLD, &mut iter)
+            {
+                self.wal_global_byte_threshold = value;
+                continue;
+            }
+        }
+        self
+    }
+
     pub fn with_wal_thresholds(
         mut self,
         leaf_checkpoint: usize,
@@ -145,7 +201,11 @@ impl QuickStepConfig {
 }
 
 impl QuickStep {
-    pub fn new(config: QuickStepConfig) -> QuickStep {
+    pub fn new(mut config: QuickStepConfig) -> QuickStep {
+        config = config
+            .with_env_overrides()
+            .with_cli_overrides(env::args().skip(1));
+
         let QuickStepConfig {
             path,
             inner_node_upper_bound,
@@ -275,6 +335,30 @@ impl QuickStep {
             }
         };
         Ok(snapshot)
+    }
+
+    pub fn debug_leaf_fences(&self, page_id: PageId) -> Result<DebugLeafFences, QSError> {
+        let guard = self.map_table.read_page_entry(page_id)?;
+        let (disk_addr, lower, upper) = match guard.node() {
+            NodeRef::MiniPage(index) => {
+                let meta = unsafe { self.cache.get_meta_ref(index) };
+                let (lower, upper) = collect_fence_keys(meta);
+                (meta.leaf(), lower, upper)
+            }
+            NodeRef::Leaf(disk_addr) => {
+                let disk_leaf = self.io_engine.get_page(disk_addr);
+                let meta = disk_leaf.as_ref();
+                let (lower, upper) = collect_fence_keys(meta);
+                (disk_addr, lower, upper)
+            }
+        };
+
+        Ok(DebugLeafFences {
+            page_id,
+            disk_addr,
+            lower,
+            upper,
+        })
     }
 
     pub fn debug_wal_stats(&self, disk_addr: Option<u64>) -> DebugWalStats {
@@ -445,6 +529,31 @@ fn wal_path_for(data_path: &Path) -> PathBuf {
     let mut wal_path = data_path.to_path_buf();
     wal_path.set_extension("wal");
     wal_path
+}
+
+fn read_env_usize(key: &str) -> Option<usize> {
+    env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn parse_cli_override<I, S>(token: &str, flag: &str, iter: &mut I) -> Option<usize>
+where
+    I: Iterator<Item = S>,
+    S: Into<String>,
+{
+    if let Some(rest) = token.strip_prefix(flag) {
+        if let Some(value) = rest.strip_prefix('=') {
+            return value.parse::<usize>().ok();
+        }
+    }
+    if token == flag {
+        if let Some(next) = iter.next() {
+            let value: String = next.into();
+            return value.parse::<usize>().ok();
+        }
+    }
+    None
 }
 
 impl<'db> QuickStepTx<'db> {
@@ -875,6 +984,22 @@ fn collect_user_keys(meta: &NodeMeta) -> Vec<Vec<u8>> {
             key
         })
         .collect()
+}
+
+fn collect_fence_keys(meta: &NodeMeta) -> (Vec<u8>, Vec<u8>) {
+    assert!(
+        meta.record_count() >= 2,
+        "leaf must contain at least the two fence keys"
+    );
+    let lower_meta = meta.get_kv_meta(0);
+    let upper_meta = meta.get_kv_meta(meta.record_count() as usize - 1);
+    assert!(
+        lower_meta.fence() && upper_meta.fence(),
+        "first and last entries must be fences"
+    );
+    let lower = meta.get_stored_key_from_meta(lower_meta).to_vec();
+    let upper = meta.get_stored_key_from_meta(upper_meta).to_vec();
+    (lower, upper)
 }
 
 fn collect_user_records(meta: &NodeMeta) -> Vec<(Vec<u8>, Vec<u8>)> {

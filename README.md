@@ -80,7 +80,8 @@ cargo doc --open
 - `QuickStep::new()` bootstraps the tree, cache, and map table, formatting the root leaf (page 0) on disk before the first transaction
 - Delete/tombstone plumbing persists user-key removals via mini-page flush, WAL replay on restart, and instrumentation-backed tests
 - Minimal WAL support (puts + deletes) replays cached updates during startup, per-leaf checkpoints prune the log, and a global WAL pressure monitor flushes the busiest leaves when the log grows too large
-- Configurable WAL thresholds via `QuickStepConfig::with_wal_thresholds(...)`, plus debug WAL stats (`QuickStep::debug_wal_stats`) and a lightweight background WAL monitor for observability/auto-checkpointing
+- Configurable WAL thresholds via `QuickStepConfig::with_wal_thresholds(...)`, the `QUICKSTEP_WAL_LEAF_THRESHOLD`, `QUICKSTEP_WAL_GLOBAL_RECORD_THRESHOLD`, and `QUICKSTEP_WAL_GLOBAL_BYTE_THRESHOLD` env vars, or CLI flags `--quickstep-wal-{leaf,global-record,global-byte}-threshold`, plus debug WAL stats (`QuickStep::debug_wal_stats`) and a lightweight background WAL monitor for observability/auto-checkpointing
+- Sentinel fence guards via `QuickStep::debug_leaf_fences` with integration tests (`tests/quickstep_fence_keys.rs`) that verify page 0, split children, merge survivors, and eviction-flushed leaves all retain the `[0x00]`/`[0xFF]` boundary keys on disk
 
 ### ⚠️ Partially Implemented
 

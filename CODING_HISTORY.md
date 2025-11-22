@@ -2,6 +2,27 @@
 
 # Coding History
 
+#### 2025-11-22 17:35 UTC [pending] [main]
+
+- Added `QuickStep::debug_leaf_fences` (plus an internal `collect_fence_keys` helper) so tests can inspect the exact lower/upper fence bytes for any leaf, whether cached or only on disk.
+- `map_table::PageId` gained `from_u64`, letting external tests refer to concrete page IDs like the bootstrapped root without poking crate-private fields.
+- Extended `tests/quickstep_fence_keys.rs` with four regression cases: root page fences, split children, manual merge survivors (`debug_merge_leaves`), and eviction-driven flushes in the tiny-cache configuration; command: `cargo test quickstep_fence_keys`.
+- Documentation (detailed plan, README, changelog, coding history) now records the fence instrumentation and regression coverage.
+
+#### 2025-11-22 17:25 UTC [pending] [main]
+
+- Added `QuickStepConfig::with_cli_overrides`, which understands `--quickstep-wal-leaf-threshold`, `--quickstep-wal-global-record-threshold`, and `--quickstep-wal-global-byte-threshold` (both `--flag=value` and `--flag value`) so WAL checkpoint tuning can be supplied via command-line args.
+- `QuickStep::new` now chains `with_env_overrides()` and `with_cli_overrides(std::env::args().skip(1))`, meaning every instantiation honours runtime overrides without custom caller glue.
+- Extended `tests/quickstep_config_env.rs` to cover CLI overrides (positive + invalid inputs) and re-ran `cargo test quickstep_config_env`.
+- Documentation (plan, README, changelog, coding history) updated to list the CLI flags alongside the env vars.
+
+#### 2025-11-22 17:15 UTC [pending] [main]
+
+- `QuickStepConfig::with_env_overrides` reads `QUICKSTEP_WAL_LEAF_THRESHOLD`, `QUICKSTEP_WAL_GLOBAL_RECORD_THRESHOLD`, and `QUICKSTEP_WAL_GLOBAL_BYTE_THRESHOLD`, letting deployments tune WAL checkpoint pressure without rebuilding.
+- `QuickStep::new` applies those overrides automatically so every call path (tests, binaries) inherits the configured thresholds.
+- Added `QuickStepConfig::wal_thresholds()` for tests, plus new `tests/quickstep_config_env.rs` that validates both successful overrides and invalid input fallbacks; executed via `cargo test quickstep_config_env`.
+- Updated `design/detailed-plan.md`, README, CHANGELOG, and this history with the new configuration surface and test coverage.
+
 #### 2025-11-22 17:05 UTC [pending] [main]
 
 - `WalManager` now stores both put (`{page_id, disk_addr, key, value}`) and delete records, replaying them before the cache/map-table bootstrap when `QuickStep::new()` starts up; checkpoints remove entries per leaf after eviction or manual flush.
