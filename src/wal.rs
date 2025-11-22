@@ -16,6 +16,8 @@ pub struct WalRecord {
     pub page_id: u64,
     pub disk_addr: u64,
     pub key: Vec<u8>,
+    pub lower_fence: Vec<u8>,
+    pub upper_fence: Vec<u8>,
     pub op: WalOp,
 }
 
@@ -95,11 +97,20 @@ impl WalManager {
         state.records.clone()
     }
 
-    pub fn append_tombstone(&self, page_id: PageId, disk_addr: u64, key: &[u8]) -> io::Result<()> {
+    pub fn append_tombstone(
+        &self,
+        page_id: PageId,
+        disk_addr: u64,
+        key: &[u8],
+        lower_fence: &[u8],
+        upper_fence: &[u8],
+    ) -> io::Result<()> {
         self.append_record(WalRecord {
             page_id: page_id.as_u64(),
             disk_addr,
             key: key.to_vec(),
+            lower_fence: lower_fence.to_vec(),
+            upper_fence: upper_fence.to_vec(),
             op: WalOp::Tombstone,
         })
     }
@@ -110,11 +121,15 @@ impl WalManager {
         disk_addr: u64,
         key: &[u8],
         value: &[u8],
+        lower_fence: &[u8],
+        upper_fence: &[u8],
     ) -> io::Result<()> {
         self.append_record(WalRecord {
             page_id: page_id.as_u64(),
             disk_addr,
             key: key.to_vec(),
+            lower_fence: lower_fence.to_vec(),
+            upper_fence: upper_fence.to_vec(),
             op: WalOp::Put {
                 value: value.to_vec(),
             },
@@ -241,18 +256,30 @@ fn write_record(file: &mut File, record: &WalRecord) -> io::Result<()> {
             file.write_all(&record.disk_addr.to_le_bytes())?;
             let key_len = record.key.len() as u32;
             let val_len = value.len() as u32;
+            let lower_len = record.lower_fence.len() as u32;
+            let upper_len = record.upper_fence.len() as u32;
             file.write_all(&key_len.to_le_bytes())?;
             file.write_all(&val_len.to_le_bytes())?;
+            file.write_all(&lower_len.to_le_bytes())?;
+            file.write_all(&upper_len.to_le_bytes())?;
             file.write_all(&record.key)?;
             file.write_all(value)?;
+            file.write_all(&record.lower_fence)?;
+            file.write_all(&record.upper_fence)?;
         }
         WalOp::Tombstone => {
             file.write_all(&[RECORD_TYPE_TOMBSTONE])?;
             file.write_all(&record.page_id.to_le_bytes())?;
             file.write_all(&record.disk_addr.to_le_bytes())?;
             let key_len = record.key.len() as u32;
+            let lower_len = record.lower_fence.len() as u32;
+            let upper_len = record.upper_fence.len() as u32;
             file.write_all(&key_len.to_le_bytes())?;
+            file.write_all(&lower_len.to_le_bytes())?;
+            file.write_all(&upper_len.to_le_bytes())?;
             file.write_all(&record.key)?;
+            file.write_all(&record.lower_fence)?;
+            file.write_all(&record.upper_fence)?;
         }
     }
     Ok(())
@@ -277,27 +304,39 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, Option<u64>)> {
         idx += 8;
         match record_type {
             RECORD_TYPE_TOMBSTONE => {
-                if bytes.len() - idx < 4 {
+                if bytes.len() - idx < 12 {
                     idx = record_start;
                     break;
                 }
                 let key_len = u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
                 idx += 4;
-                if bytes.len() - idx < key_len {
+                let lower_len =
+                    u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+                idx += 4;
+                let upper_len =
+                    u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+                idx += 4;
+                if bytes.len() - idx < key_len + lower_len + upper_len {
                     idx = record_start;
                     break;
                 }
                 let key = bytes[idx..idx + key_len].to_vec();
                 idx += key_len;
+                let lower = bytes[idx..idx + lower_len].to_vec();
+                idx += lower_len;
+                let upper = bytes[idx..idx + upper_len].to_vec();
+                idx += upper_len;
                 records.push(WalRecord {
                     page_id,
                     disk_addr,
                     key,
+                    lower_fence: lower,
+                    upper_fence: upper,
                     op: WalOp::Tombstone,
                 });
             }
             RECORD_TYPE_PUT => {
-                if bytes.len() - idx < 8 {
+                if bytes.len() - idx < 16 {
                     idx = record_start;
                     break;
                 }
@@ -305,7 +344,13 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, Option<u64>)> {
                 idx += 4;
                 let val_len = u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
                 idx += 4;
-                if bytes.len() - idx < key_len + val_len {
+                let lower_len =
+                    u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+                idx += 4;
+                let upper_len =
+                    u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+                idx += 4;
+                if bytes.len() - idx < key_len + val_len + lower_len + upper_len {
                     idx = record_start;
                     break;
                 }
@@ -313,10 +358,16 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, Option<u64>)> {
                 idx += key_len;
                 let value = bytes[idx..idx + val_len].to_vec();
                 idx += val_len;
+                let lower = bytes[idx..idx + lower_len].to_vec();
+                idx += lower_len;
+                let upper = bytes[idx..idx + upper_len].to_vec();
+                idx += upper_len;
                 records.push(WalRecord {
                     page_id,
                     disk_addr,
                     key,
+                    lower_fence: lower,
+                    upper_fence: upper,
                     op: WalOp::Put { value },
                 });
             }
@@ -336,7 +387,29 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, Option<u64>)> {
 
 fn record_size(record: &WalRecord) -> usize {
     match &record.op {
-        WalOp::Put { value } => 1 + 8 + 8 + 4 + 4 + record.key.len() + value.len(),
-        WalOp::Tombstone => 1 + 8 + 8 + 4 + record.key.len(),
+        WalOp::Put { value } => {
+            1
+                + 8
+                + 8
+                + 4
+                + 4
+                + 4
+                + 4
+                + record.key.len()
+                + value.len()
+                + record.lower_fence.len()
+                + record.upper_fence.len()
+        }
+        WalOp::Tombstone => {
+            1
+                + 8
+                + 8
+                + 4
+                + 4
+                + 4
+                + record.key.len()
+                + record.lower_fence.len()
+                + record.upper_fence.len()
+        }
     }
 }

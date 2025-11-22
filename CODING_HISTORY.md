@@ -2,11 +2,29 @@
 
 # Coding History
 
+#### 2025-11-22 18:50 UTC [pending] [main]
+
+- Documented Phase 1.4 in `design/detailed-plan.md`: WAL records will switch to logical `PageId`s, serialize fence blobs + grouped mutations per leaf, and replay will hydrate each page via the current map-table binding before writing back to disk. The section also tracks the required serializer/deserializer changes, replay ordering, regression tests, and documentation tasks.
+- Updated README’s status table to highlight that WAL crash recovery remains partially implemented until the PageId-based redesign ships, giving contributors/users a clear pointer to the plan.
+- Noted in the changelog that the plan/README were refreshed so the next commit can reference an agreed blueprint for the WAL hardening work.
+
+#### 2025-11-22 17:39 UTC [pending] [main]
+
+- Added parent-derived fence plumbing: `NodeMeta` can now reset leaves with explicit lower/upper bounds, `LeafSplitPlan` installs `[lower, pivot] / [pivot, upper]` fences after every split, and `LeafMergePlan` rewrites the survivor with `left.lower` and `right.upper` so the merged leaf’s prefix compression stays valid.
+- `Tests/quickstep_fence_keys.rs` now checks pivot-derived fences, eviction survivors, and delete-triggered auto merges using a helper that asserts every fence range strictly covers the resident keys (root still asserts the sentinel `[0x00]/[0xFF]` bounds).
+- Updated the design plan, README, and changelog to describe the new fence propagation plus the broader regression suite.
+
+#### 2025-11-22 17:55 UTC [pending] [main]
+
+- `WalRecord` now includes `lower_fence`/`upper_fence`, `WalManager` writes/reads the extra payloads, and every WAL append call (`append_put`/`append_tombstone`) captures the current leaf fences so crash replay can reinstall the same ranges.
+- Replay keeps a per-leaf fence map and rebuilds the disk leaf (via `reset_user_entries_with_fences` + `replay_entries`) after applying all records, which ensures pivot-derived bounds persist even if a crash occurs before the leaf is flushed.
+- Added `QuickStep::debug_disk_leaf_fences` and `tests/quickstep_delete_persist.rs::wal_records_include_fence_bounds` to expose and validate the new metadata.
+
 #### 2025-11-22 17:35 UTC [pending] [main]
 
 - Added `QuickStep::debug_leaf_fences` (plus an internal `collect_fence_keys` helper) so tests can inspect the exact lower/upper fence bytes for any leaf, whether cached or only on disk.
 - `map_table::PageId` gained `from_u64`, letting external tests refer to concrete page IDs like the bootstrapped root without poking crate-private fields.
-- Extended `tests/quickstep_fence_keys.rs` with four regression cases: root page fences, split children, manual merge survivors (`debug_merge_leaves`), and eviction-driven flushes in the tiny-cache configuration; command: `cargo test quickstep_fence_keys`.
+- Extended `tests/quickstep_fence_keys.rs` with five regression cases: root page fences, split children, manual merge survivors (`debug_merge_leaves`), eviction-driven flushes in the tiny-cache configuration, and delete-triggered auto merges that rely solely on the public `delete` API; command: `cargo test quickstep_fence_keys`.
 - Documentation (detailed plan, README, changelog, coding history) now records the fence instrumentation and regression coverage.
 
 #### 2025-11-22 17:25 UTC [pending] [main]

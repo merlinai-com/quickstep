@@ -121,7 +121,7 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
       - ✅ **Testing**: `tests/quickstep_delete_persist.rs` now covers both crash scenarios—`wal_replays_deletes_without_manual_flush` for deletes and `wal_replays_puts_without_manual_flush` for inserts.
       - ✅ **Global pressure**: background policy monitors total WAL length (records + bytes) and proactively checkpoints the “noisiest” leaves once thresholds are exceeded; per-leaf stats track record counts/bytes so flushes remove the right entries without blocking foreground writes. Configurable thresholds + WAL debug stats (`QuickStep::debug_wal_stats`) keep observability high for tuning, and a lightweight background monitor thread now raises checkpoint requests when limits are exceeded.
    - ✅ **Config overrides**: `QuickStepConfig::with_env_overrides` reads `QUICKSTEP_WAL_LEAF_THRESHOLD`, `QUICKSTEP_WAL_GLOBAL_RECORD_THRESHOLD`, and `QUICKSTEP_WAL_GLOBAL_BYTE_THRESHOLD`, while `with_cli_overrides` understands `--quickstep-wal-{leaf,global-record,global-byte}-threshold[=N]` flags so deployments can tune flush policy via env vars or CLI; `tests/quickstep_config_env.rs` covers positive + invalid input cases.
-   - ✅ **Fence invariants**: Added `QuickStep::debug_leaf_fences` + `tests/quickstep_fence_keys.rs` to assert the root leaf, split children, merge survivors, and eviction-flushed leaves all retain the `0x00`/`0xFF` sentinel fences on disk.
+   - ✅ **Fence invariants**: Added `QuickStep::debug_leaf_fences` + `tests/quickstep_fence_keys.rs` to assert the root leaf, split children, merge survivors, eviction-flushed leaves, and delete-triggered auto-merge survivors all keep consistent fence bounds; splits now derive upper/lower fences from parent pivots rather than relying on hard-coded sentinels so prefix compression stays correct after splits/merges. WAL records now embed the leaf’s current `[lower, upper]` fences so replay can reinstall the same bounds after a crash, and `QuickStep::debug_disk_leaf_fences` exposes on-disk ranges for verification.
 
 3. **Testing**
    - ✅ Added `tests/quickstep_split.rs::root_split_occurs_and_is_readable`:
@@ -142,4 +142,31 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
 4. **Open questions**
    - ✅ Resolved 22 Nov 2025: `QuickStep::new` now formats page 0 on disk (header + sentinel fence keys) before bootstrapping the map table, and every subsequent mini-page allocation calls `ensure_fence_keys` so promotion no longer needs a bootstrap path.
    - Inner-node serialization helpers are not implemented yet (`BPNode` currently only supports searching). We will implement just enough (key insertion + child pointer storage) for the root case in this phase.
+
+---
+
+## 1.4 – WAL replay hardening (Planned)
+
+**Goal:** decouple crash recovery from stale disk addresses by logging and replaying mutations per logical `PageId`, reinstalling real fence bounds before rehydrating user entries, and documenting any remaining crash-time limitations.
+
+### 1.4.1 – Format & plumbing updates
+1. Rework `WalRecord` to encode the logical `PageId`, fence bounds, and an opaque payload that explicitly references the survivor leaf (no more physical `disk_addr` coupling). We will keep the current fences in the record so replay can install them deterministically.
+2. Update the serializer/deserializer to write a compact header `{page_id, lower_len, upper_len, payload_len}` followed by the fence blobs and key/value record payload. While here, teach the WAL writer to batch records per page (length-prefixed group) so replay knows exactly when a leaf’s slice ends.
+3. Extend `WalManager` with helpers to stream grouped records: `records_by_page()` returns an iterator of `(PageId, Vec<WalRecord>)`, avoiding the current ad-hoc `Vec` rebuild in `QuickStep::replay_wal`.
+4. Modify `QuickStepTx::append_wal_put/delete` to pass the logical `PageId`, fences, and user payload to the new writer. Disk addresses are still needed for checkpoints, but they no longer appear in non-checkpoint records.
+
+### 1.4.2 – Replay redesign
+1. During startup, call `records_by_page()` and, for each `PageId`, resolve the latest binding through the map table. If the page is already cached, borrow its `NodeMeta`; otherwise, fetch the disk leaf, promote it into a temporary `DiskLeaf`, and install the logged fences via `reset_user_entries_with_fences`.
+2. Apply the grouped WAL payloads in key-sorted order via `NodeMeta::replay_entries`, so replayed leaves stay within page size limits even if earlier on-disk images were fuller. After every page group is applied, write the leaf back to disk and, if the page is cached, refresh the cache copy.
+3. Teach replay to install fence metadata before user entries, ensuring delete-triggered auto-merges, evictions, and WAL recovery all agree on the survivor’s key range.
+4. Once a page’s WAL group finishes successfully, drop those records from the log (`checkpoint_page`), so the WAL never accumulates stale page bindings again.
+
+### 1.4.3 – Testing & docs
+1. Re-enable the merge-crash regression using only public ops (`put`/`delete`/auto-merge). Add a complementary eviction test that drives a WAL replay after evicting one sibling to disk and keeping the other cached.
+2. Extend `tests/quickstep_fence_keys.rs` to assert fence monotonicity after WAL replay plus delete-triggered merges, ensuring fence metadata survives splits, merges, evictions, and crashes.
+3. Document the new replay pipeline and any remaining crash constraints in `README.md` + this plan. Call out that WAL recovery now trusts logical `PageId`s rather than physical disk addresses, eliminating the `InsufficientSpace` failures we saw when reapplying stale layouts.
+
+### 1.4.4 – Rollout
+1. Land the format + replay changes behind a feature branch, run the full `quickstep_delete_persist` suite, and explicitly record the before/after behaviour in `CODING_HISTORY.md`.
+2. Once stable, trim the old fence-sentinel code and update the operator docs with the new guarantees (fence metadata logged per leaf, WAL grouped per page). Finish by marking 1.4 as “Complete” in this plan.
 

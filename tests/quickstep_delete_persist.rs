@@ -1,8 +1,115 @@
-use quickstep::{QuickStep, QuickStepConfig};
+use quickstep::{
+    debug,
+    map_table::PageId,
+    wal::WalManager,
+    QuickStep,
+    QuickStepConfig,
+};
 use tempfile::TempDir;
 
 fn wal_record_count(db: &QuickStep, disk_addr: Option<u64>) -> usize {
     db.debug_wal_stats(disk_addr).leaf_records.unwrap_or(0)
+}
+
+#[test]
+fn wal_records_include_fence_bounds() {
+    let temp = TempDir::new().expect("tempdir");
+    let wal_path = temp.path().join("quickstep.wal");
+    {
+        let wal = WalManager::open(&wal_path).expect("open wal");
+        wal.append_put(
+            PageId::from_u64(7),
+            128,
+            b"key-0001",
+            b"value",
+            &[0x00],
+            &[0x7F],
+        )
+        .expect("append put");
+        wal.append_tombstone(PageId::from_u64(7), 128, b"key-0002", &[0x10], &[0x80])
+            .expect("append tombstone");
+    }
+
+    let wal = WalManager::open(&wal_path).expect("reopen wal");
+    let records = wal.records();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].lower_fence, vec![0x00]);
+    assert_eq!(records[0].upper_fence, vec![0x7F]);
+    assert_eq!(records[1].lower_fence, vec![0x10]);
+    assert_eq!(records[1].upper_fence, vec![0x80]);
+}
+
+#[test]
+fn wal_replay_survives_merge_crash() {
+    let temp = TempDir::new().expect("tempdir");
+    let db_path = temp.path().join("db");
+    let pivot_key: Vec<u8>;
+    {
+        debug::reset_debug_counters();
+        let cfg = QuickStepConfig::new(db_path.clone(), 32, 256, 14)
+            .with_wal_thresholds(usize::MAX, usize::MAX, usize::MAX);
+        let db = QuickStep::new(cfg);
+        let payload = vec![0u8; 64];
+        const TOTAL_KEYS: usize = 96;
+        const KEPT_PREFIX: usize = 4;
+
+        {
+            let mut tx = db.tx();
+            for idx in 0..TOTAL_KEYS {
+                let key = format!("key-{idx:04}");
+                tx.put(key.as_bytes(), &payload).expect("insert");
+            }
+            tx.commit();
+        }
+
+        let parent = db
+            .debug_root_leaf_parent()
+            .expect("root should have promoted");
+        pivot_key = parent.pivots[0].clone();
+        let pivot_idx = String::from_utf8(pivot_key.clone())
+            .expect("pivot is valid utf8")
+            .rsplit_once('-')
+            .and_then(|(_, suffix)| suffix.parse::<usize>().ok())
+            .expect("pivot suffix");
+        assert!(
+            KEPT_PREFIX < pivot_idx,
+            "pivot should reference right-hand leaf"
+        );
+
+        {
+            let mut tx = db.tx();
+            for idx in 0..TOTAL_KEYS {
+                let key = format!("key-{idx:04}");
+                if idx >= KEPT_PREFIX {
+                    tx.delete(key.as_bytes()).expect("delete");
+                }
+            }
+            tx.commit();
+        }
+
+        if let Some(parent) = db.debug_root_leaf_parent() {
+            if parent.children.len() == 2 {
+                db.debug_merge_leaves(parent.children[0], parent.children[1])
+                    .expect("manual merge");
+            }
+        }
+        // drop db without flushing to force WAL replay on restart
+    }
+
+    let reopened = QuickStep::new(
+        QuickStepConfig::new(db_path, 32, 256, 14)
+            .with_wal_thresholds(usize::MAX, usize::MAX, usize::MAX),
+    );
+    let snapshot = reopened
+        .debug_leaf_snapshot(PageId::from_u64(0))
+        .expect("root snapshot");
+    assert!(
+        snapshot
+            .keys
+            .iter()
+            .all(|k| k.as_slice() < pivot_key.as_slice()),
+        "right-side keys should not survive merge replay"
+    );
 }
 
 #[test]

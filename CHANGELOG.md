@@ -6,13 +6,38 @@
 
 # Changelog
 
+#### 2025-11-22 18:50 UTC [pending] [main]
+
+##### Phase 1.4 WAL replay hardening plan
+
+- Added Section 1.4 to `design/detailed-plan.md`, outlining the move from disk-address-based WAL entries to PageId-grouped records, replay-time fence reinstalls, per-leaf grouping in the serializer/deserializer, and the accompanying regression/documentation work.
+- Updated the README “Partially Implemented” list to call out the forthcoming Phase 1.4 crash-recovery changes so the status page reflects why WAL redesign is the current priority.
+- GUC prep: roadmap/design/README now agree on the PageId-focused replay plan ahead of the implementation work.
+
+#### 2025-11-22 17:55 UTC [pending] [main]
+
+##### Phase 1.3 WAL fence metadata
+
+- `WalRecord` now stores the leaf’s current lower/upper fence keys, and `WalManager` serializes/deserializes them so every WAL PUT/Tombstone carries the exact bounds the leaf had when the write occurred.
+- `QuickStepTx::put`/`delete` capture the fences from the active mini-page and pass them to the WAL, while WAL replay installs the recorded fences on each touched disk leaf before/after applying the pending writes. `QuickStep::debug_disk_leaf_fences` exposes the post-replay bounds for inspection.
+- Added `tests/quickstep_delete_persist.rs::wal_records_include_fence_bounds` to ensure WAL round-trips fence metadata correctly, and the fence regression suite (`tests/quickstep_fence_keys.rs`) continues to exercise parent-derived bounds after splits/merges/evictions.
+
+#### 2025-11-22 17:39 UTC [pending] [main]
+
+##### Phase 1.3 parent-derived fence bounds
+
+- `NodeMeta` now supports resetting leaves with arbitrary lower/upper fences; `LeafSplitPlan` and `LeafMergePlan` propagate parent pivots so newly split (or merged) leaves adopt accurate bounds instead of the previous hard-coded `[0x00]/[0xFF]` sentinels. This keeps prefix compression correct across splits/merges.
+- `QuickStepTx::merge_leaf_pages` plus the delete-driven auto-merge path now leave survivors with lower fences from the left sibling and upper fences from the right sibling, ensuring their fence range spans the combined key space.
+- `tests/quickstep_fence_keys.rs` was expanded to verify: root sentinels, pivot-derived split fences, merge survivors, eviction survivors, and delete-triggered auto merges all report fence ranges that cover their user keys.
+- Documentation (detailed plan, README) updated to describe the parent-derived fence behaviour.
+
 #### 2025-11-22 17:35 UTC [pending] [main]
 
 ##### Phase 1.3 sentinel fence audit
 
 - Added `QuickStep::debug_leaf_fences` plus a helper to extract the lower/upper fence bytes from any leaf (mini-page or on-disk), exposing the disk address alongside the fence keys for debug assertions.
 - Extended `map_table::PageId` with `from_u64` so tests can reference concrete page IDs (e.g., the root) without reaching into crate-private internals.
-- `tests/quickstep_fence_keys.rs` now covers four scenarios: page 0 at bootstrap, the two children created by the first root split, manual leaf merges via `debug_merge_leaves`, and eviction-driven flushes in the tiny-cache configuration; executed via `cargo test quickstep_fence_keys`.
+- `tests/quickstep_fence_keys.rs` now covers five scenarios: page 0 at bootstrap, the two children created by the first root split, manual leaf merges via `debug_merge_leaves`, eviction-driven flushes in the tiny-cache configuration, and delete-driven auto merges that run through the production `delete` path; executed via `cargo test quickstep_fence_keys`.
 - Updated the detailed plan and README status table to note the fence instrumentation/coverage.
 
 #### 2025-11-22 17:25 UTC [pending] [main]

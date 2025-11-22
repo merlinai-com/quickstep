@@ -19,53 +19,21 @@ impl NodeMeta {
         if self.record_count() <= 2 {
             return;
         }
+        let (lower, upper) = self.fence_bounds();
+        self.reset_user_entries_with_fences(&lower, &upper);
+    }
 
-        let lower_fence = self.get_kv_meta(0);
-        let upper_fence = self.get_kv_meta(self.record_count() as usize - 1);
-
-        self.set_kv_meta(0, lower_fence);
-        self.set_kv_meta(1, upper_fence);
-        self.set_record_count(2);
+    pub fn reset_user_entries_with_fences(&mut self, lower: &[u8], upper: &[u8]) {
+        self.install_fences(lower, upper);
     }
 
     pub fn ensure_fence_keys(&mut self) {
         if self.record_count() >= 2 {
             return;
         }
-
-        let mut cursor = self.size().size_in_bytes();
-        let base_ptr = self.get_base_ptr() as *mut u8;
-
         const LOWER_FENCE: [u8; 1] = [0x00];
         const UPPER_FENCE: [u8; 1] = [0xFF];
-
-        unsafe {
-            self.set_record_count(2);
-
-            cursor -= UPPER_FENCE.len();
-            base_ptr
-                .add(cursor)
-                .copy_from_nonoverlapping(UPPER_FENCE.as_ptr(), UPPER_FENCE.len());
-            let upper_offset = cursor as usize;
-
-            cursor -= LOWER_FENCE.len();
-            base_ptr
-                .add(cursor)
-                .copy_from_nonoverlapping(LOWER_FENCE.as_ptr(), LOWER_FENCE.len());
-            let lower_offset = cursor as usize;
-
-            let mut lower_meta =
-                KVMeta::new(LOWER_FENCE.len(), 0, 0, KVRecordType::Cache, true, true, 0);
-            let _ = lower_meta.set_offset(lower_offset as u16);
-            self.set_kv_meta(0, lower_meta);
-
-            let mut upper_meta =
-                KVMeta::new(UPPER_FENCE.len(), 0, 0, KVRecordType::Cache, true, true, 0);
-            let _ = upper_meta.set_offset(upper_offset as u16);
-            self.set_kv_meta(1, upper_meta);
-        }
-
-        debug_assert!(self.record_count() >= 2, "failed to install fence keys");
+        self.install_fences(&LOWER_FENCE, &UPPER_FENCE);
     }
 
     pub fn format_leaf(&mut self, page_id: PageId, size: NodeSize, disk_addr: u64) {
@@ -483,6 +451,48 @@ impl NodeMeta {
     #[inline]
     fn get_base_ptr(&self) -> *const u8 {
         self as *const NodeMeta as *const u8
+    }
+
+    pub fn fence_bounds(&self) -> (Vec<u8>, Vec<u8>) {
+        let lower_meta = self.get_kv_meta(0);
+        let upper_meta = self.get_kv_meta(self.record_count() as usize - 1);
+        (
+            self.get_stored_key_from_meta(lower_meta).to_vec(),
+            self.get_stored_key_from_meta(upper_meta).to_vec(),
+        )
+    }
+
+    fn install_fences(&mut self, lower: &[u8], upper: &[u8]) {
+        let mut cursor = self.size().size_in_bytes();
+        let base_ptr = self.get_base_ptr() as *mut u8;
+
+        cursor -= upper.len();
+        unsafe {
+            base_ptr
+                .add(cursor)
+                .copy_from_nonoverlapping(upper.as_ptr(), upper.len());
+        }
+        let upper_offset = cursor as u16;
+
+        cursor -= lower.len();
+        unsafe {
+            base_ptr
+                .add(cursor)
+                .copy_from_nonoverlapping(lower.as_ptr(), lower.len());
+        }
+        let lower_offset = cursor as u16;
+
+        self.set_record_count(2);
+
+        let mut lower_meta =
+            KVMeta::new(lower.len(), 0, 0, KVRecordType::Cache, true, true, 0);
+        let _ = lower_meta.set_offset(lower_offset);
+        self.set_kv_meta(0, lower_meta);
+
+        let mut upper_meta =
+            KVMeta::new(upper.len(), 0, 0, KVRecordType::Cache, true, true, 0);
+        let _ = upper_meta.set_offset(upper_offset);
+        self.set_kv_meta(1, upper_meta);
     }
 }
 

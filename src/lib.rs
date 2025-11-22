@@ -7,6 +7,7 @@
 //! [design documentation](../design/).
 
 use std::{
+    collections::{BTreeMap, HashMap},
     env,
     path::{Path, PathBuf},
     ptr,
@@ -27,7 +28,7 @@ use crate::{
     map_table::{MapTable, PageId},
     page_op::{LeafMergePlan, LeafSplitOutcome, LeafSplitPlan, TryPutResult},
     types::{NodeMeta, NodeRef, NodeSize},
-    wal::{WalManager, WalOp, WalRecord},
+    wal::{WalManager, WalOp},
 };
 
 pub mod btree;
@@ -380,31 +381,49 @@ impl QuickStep {
         if records.is_empty() {
             return;
         }
+
+        struct LeafReplayState {
+            lower: Vec<u8>,
+            upper: Vec<u8>,
+            entries: BTreeMap<Vec<u8>, Vec<u8>>,
+        }
+
+        let mut hydrated: HashMap<u64, LeafReplayState> = HashMap::new();
         for record in records.iter() {
-            self.apply_wal_record(record);
-        }
-        self.wal.clear().expect("failed to clear WAL after replay");
-    }
+            let state = hydrated.entry(record.disk_addr).or_insert_with(|| LeafReplayState {
+                lower: record.lower_fence.clone(),
+                upper: record.upper_fence.clone(),
+                entries: BTreeMap::new(),
+            });
 
-    fn apply_wal_record(&self, record: &WalRecord) {
-        let mut leaf = self.io_engine.get_page(record.disk_addr);
-        let meta = leaf.as_mut();
-        if meta.record_count() < 2 {
-            meta.format_leaf(PageId(record.page_id), NodeSize::LeafPage, record.disk_addr);
-        }
-
-        match &record.op {
-            WalOp::Tombstone => {
-                if meta.remove_key_physical(&record.key) {
-                    self.io_engine.write_page(record.disk_addr, &leaf);
+            match &record.op {
+                WalOp::Tombstone => {
+                    state.entries.remove(&record.key);
+                }
+                WalOp::Put { value } => {
+                    state
+                        .entries
+                        .insert(record.key.clone(), value.clone());
                 }
             }
-            WalOp::Put { value } => {
-                meta.try_put(&record.key, value)
-                    .expect("disk leaf should accept WAL replay");
-                self.io_engine.write_page(record.disk_addr, &leaf);
-            }
         }
+
+        for (disk_addr, state) in hydrated.into_iter() {
+            let mut leaf = self.io_engine.get_page(disk_addr);
+            {
+                let meta = leaf.as_mut();
+                meta.reset_user_entries_with_fences(&state.lower, &state.upper);
+                meta.replay_entries(
+                    state
+                        .entries
+                        .iter()
+                        .map(|(key, value)| (key.as_slice(), value.as_slice())),
+                )
+                .expect("disk leaf should accept WAL replay");
+            }
+            self.io_engine.write_page(disk_addr, &leaf);
+        }
+        self.wal.clear().expect("failed to clear WAL after replay");
     }
 
     pub fn debug_wal_record_count(&self) -> usize {
@@ -577,15 +596,38 @@ impl<'db> QuickStepTx<'db> {
         key: &[u8],
         val: &[u8],
     ) -> Result<(), QSError> {
-        let disk_addr = match guard.get_write_guard().node() {
-            NodeRef::MiniPage(idx) => unsafe { db.cache.get_meta_ref(idx) }.leaf(),
-            NodeRef::Leaf(addr) => addr,
-        };
+        let (disk_addr, lower_fence, upper_fence) = Self::leaf_snapshot(db, guard);
         db.wal
-            .append_put(guard.page_id(), disk_addr, key, val)
+            .append_put(
+                guard.page_id(),
+                disk_addr,
+                key,
+                val,
+                &lower_fence,
+                &upper_fence,
+            )
             .expect("failed to record put in WAL");
         Self::maybe_checkpoint_leaf(db, guard, disk_addr)?;
         Ok(())
+    }
+
+    fn leaf_snapshot(
+        db: &'db QuickStep,
+        guard: &mut WriteGuardWrapper<'db>,
+    ) -> (u64, Vec<u8>, Vec<u8>) {
+        match guard.get_write_guard().node() {
+            NodeRef::MiniPage(idx) => {
+                let meta = unsafe { db.cache.get_meta_ref(idx) };
+                let (lower, upper) = meta.fence_bounds();
+                (meta.leaf(), lower, upper)
+            }
+            NodeRef::Leaf(addr) => {
+                let leaf = db.io_engine.get_page(addr);
+                let meta = leaf.as_ref();
+                let (lower, upper) = collect_fence_keys(meta);
+                (addr, lower, upper)
+            }
+        }
     }
 
     fn maybe_checkpoint_leaf(
@@ -1142,17 +1184,20 @@ impl<'db> QuickStepTx<'db> {
             NodeRef::MiniPage(idx) => idx,
             NodeRef::Leaf(_) => unreachable!("mini page expected after promotion"),
         };
-        let meta = unsafe { self.db.cache.get_meta_mut(index) };
-        let removed = meta.mark_tombstone(key);
-        if !removed {
-            return Ok(false);
+        let user_entries;
+        {
+            let meta = unsafe { self.db.cache.get_meta_mut(index) };
+            let removed = meta.mark_tombstone(key);
+            if !removed {
+                return Ok(false);
+            }
+            user_entries = meta.user_entry_count();
         }
-        let disk_addr = meta.leaf();
+        let (disk_addr, lower_fence, upper_fence) = Self::leaf_snapshot(self.db, &mut page_guard);
         self.db
             .wal
-            .append_tombstone(page_id, disk_addr, key)
+            .append_tombstone(page_id, disk_addr, key, &lower_fence, &upper_fence)
             .expect("failed to record delete in WAL");
-        let user_entries = meta.user_entry_count();
         Self::maybe_checkpoint_leaf(self.db, &mut page_guard, disk_addr)?;
         self.maybe_global_checkpoint()?;
         if user_entries <= AUTO_MERGE_MIN_ENTRIES {

@@ -81,7 +81,7 @@ cargo doc --open
 - Delete/tombstone plumbing persists user-key removals via mini-page flush, WAL replay on restart, and instrumentation-backed tests
 - Minimal WAL support (puts + deletes) replays cached updates during startup, per-leaf checkpoints prune the log, and a global WAL pressure monitor flushes the busiest leaves when the log grows too large
 - Configurable WAL thresholds via `QuickStepConfig::with_wal_thresholds(...)`, the `QUICKSTEP_WAL_LEAF_THRESHOLD`, `QUICKSTEP_WAL_GLOBAL_RECORD_THRESHOLD`, and `QUICKSTEP_WAL_GLOBAL_BYTE_THRESHOLD` env vars, or CLI flags `--quickstep-wal-{leaf,global-record,global-byte}-threshold`, plus debug WAL stats (`QuickStep::debug_wal_stats`) and a lightweight background WAL monitor for observability/auto-checkpointing
-- Sentinel fence guards via `QuickStep::debug_leaf_fences` with integration tests (`tests/quickstep_fence_keys.rs`) that verify page 0, split children, merge survivors, and eviction-flushed leaves all retain the `[0x00]`/`[0xFF]` boundary keys on disk
+- Fence guards derived from parent pivots via `QuickStep::debug_leaf_fences`, with integration tests (`tests/quickstep_fence_keys.rs`) that verify page 0 uses the sentinel `[0x00]`/`[0xFF]` bounds while split children, merge survivors, eviction-flushed leaves, and delete-triggered auto-merge survivors maintain monotonic lower/upper fences that cover their user keys; WAL entries now embed those fence bounds so crash replay reinstalls the same ranges before applying writes
 
 ### ⚠️ Partially Implemented
 
@@ -92,6 +92,7 @@ cargo doc --open
 - Merge logic (leaf-level merge plan, parent rewiring, root demotion, and merge instrumentation are implemented; delete-triggered thresholds and non-root cascading merges are still outstanding)
 - Buffer eviction (structure present, merge-to-disk incomplete)
 - I/O engine (read/write path works; WAL still lacks redo/undo for complex transactions and finer-grained checkpoint orchestration)
+- WAL crash recovery is currently coupled to physical disk addresses; Phase 1.4 (see `design/detailed-plan.md`) will log mutations per logical `PageId`, batch WAL entries per leaf, reinstall recorded fence bounds on replay, and document any remaining crash-time limitations before we reinstate the larger regression suite.
 
 ### ❌ Not Yet Implemented
 

@@ -12,6 +12,8 @@ pub struct LeafSplitPlan {
     pub pivot_key: Vec<u8>,
     pub left_entries: Vec<LeafEntryOwned>,
     pub right_entries: Vec<LeafEntryOwned>,
+    pub lower_fence: Vec<u8>,
+    pub upper_fence: Vec<u8>,
 }
 
 #[allow(dead_code)]
@@ -71,11 +73,15 @@ impl LeafSplitPlan {
             .map(|entry| LeafEntryOwned::from_entry(prefix, entry))
             .collect();
 
+        let (lower_fence, upper_fence) = meta.fence_bounds();
+
         LeafSplitPlan {
             prefix: prefix_buf,
             pivot_key,
             left_entries,
             right_entries,
+            lower_fence,
+            upper_fence,
         }
     }
 
@@ -84,14 +90,14 @@ impl LeafSplitPlan {
         left: &mut NodeMeta,
         right: &mut NodeMeta,
     ) -> Result<LeafSplitOutcome, InsufficientSpace> {
-        left.reset_user_entries();
+        left.reset_user_entries_with_fences(&self.lower_fence, &self.pivot_key);
         left.replay_entries(
             self.left_entries
                 .iter()
                 .map(|entry| (entry.key.as_slice(), entry.value.as_slice())),
         )?;
 
-        right.reset_user_entries();
+        right.reset_user_entries_with_fences(&self.pivot_key, &self.upper_fence);
         right.replay_entries(
             self.right_entries
                 .iter()
@@ -118,6 +124,10 @@ pub struct LeafSplitOutcome {
 #[derive(Debug)]
 pub struct LeafMergePlan {
     pub entries: Vec<LeafEntryOwned>,
+    pub survivor_lower: Vec<u8>,
+    pub survivor_upper: Vec<u8>,
+    pub removed_lower: Vec<u8>,
+    pub removed_upper: Vec<u8>,
 }
 
 #[allow(dead_code)]
@@ -131,7 +141,15 @@ impl LeafMergePlan {
         let mut entries = Vec::new();
         entries.extend(owned_entries(left));
         entries.extend(owned_entries(right));
-        LeafMergePlan { entries }
+        let (left_lower, _) = left.fence_bounds();
+        let (right_lower, right_upper) = right.fence_bounds();
+        LeafMergePlan {
+            entries,
+            survivor_lower: left_lower,
+            survivor_upper: right_upper.clone(),
+            removed_lower: right_lower,
+            removed_upper: right_upper,
+        }
     }
 
     pub fn apply(
@@ -139,14 +157,14 @@ impl LeafMergePlan {
         survivor: &mut NodeMeta,
         removed: &mut NodeMeta,
     ) -> Result<LeafMergeOutcome, InsufficientSpace> {
-        survivor.reset_user_entries();
+        survivor.reset_user_entries_with_fences(&self.survivor_lower, &self.survivor_upper);
         survivor.replay_entries(
             self.entries
                 .iter()
                 .map(|entry| (entry.key.as_slice(), entry.value.as_slice())),
         )?;
 
-        removed.reset_user_entries();
+        removed.reset_user_entries_with_fences(&self.removed_lower, &self.removed_upper);
         Ok(LeafMergeOutcome {
             merged_count: self.entries.len(),
         })
