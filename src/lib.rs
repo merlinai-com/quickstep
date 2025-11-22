@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    btree::{BPTree, DebugLeafParent, OpType},
+    btree::{BPTree, ChildPointer, DebugLeafParent, OpType, WriteLockBundle},
     buffer::{MiniPageBuffer, MiniPageIndex},
     error::QSError,
     io_engine::IoEngine,
@@ -147,6 +147,10 @@ impl QuickStep {
         self.inner_nodes.debug_root_leaf_parent()
     }
 
+    pub fn debug_root_level(&self) -> u16 {
+        self.inner_nodes.root_level()
+    }
+
     /// Test helper: materialises the user keys stored in the specified leaf page.
     /// This acquires a transient read lock on the map table entry and copies the keys,
     /// so it is safe to drop immediately after use in tests.
@@ -238,30 +242,12 @@ impl<'db> QuickStepTx<'db> {
                     split_outcome.right_count,
                 );
 
-                if let Some(parent_guard) = lock_bundle.chain.last_mut() {
-                    match parent_guard.as_mut().insert_leaf_entry_after_child(
-                        page_guard.page_id(),
-                        &split_outcome.pivot_key,
-                        right_guard.page_id(),
-                    ) {
-                        Ok(()) => {}
-                        Err(QSError::NodeFull) => {
-                            todo!("parent splits are not yet implemented");
-                        }
-                        Err(e @ QSError::ParentChildMissing) => return Err(e),
-                        Err(e) => return Err(e),
-                    }
-                } else {
-                    self.db.inner_nodes.promote_leaf_root(
-                        lock_bundle
-                            .root_lock
-                            .as_mut()
-                            .expect("root lock must exist for root split"),
-                        page_guard.page_id(),
-                        right_guard.page_id(),
-                        &split_outcome.pivot_key,
-                    )?;
-                }
+                self.insert_into_parents_after_leaf_split(
+                    &mut lock_bundle,
+                    page_guard.page_id(),
+                    &split_outcome.pivot_key,
+                    right_guard.page_id(),
+                )?;
 
                 let pivot = split_outcome.pivot_key.as_slice();
                 let target_guard = if key >= pivot {
@@ -403,6 +389,115 @@ impl<'db> QuickStepTx<'db> {
 
         guard
     }
+
+    fn insert_into_parents_after_leaf_split(
+        &mut self,
+        lock_bundle: &mut WriteLockBundle<'db>,
+        left_leaf: PageId,
+        pivot_key: &[u8],
+        right_leaf: PageId,
+    ) -> Result<(), QSError> {
+        if lock_bundle.chain.is_empty() {
+            return self.db.inner_nodes.promote_leaf_root(
+                lock_bundle
+                    .root_lock
+                    .as_mut()
+                    .expect("root lock must exist for root split"),
+                left_leaf,
+                right_leaf,
+                pivot_key,
+            );
+        }
+
+        let parent_idx = lock_bundle.chain.len() - 1;
+        let level = lock_bundle.chain[parent_idx].level;
+        let guard = &mut lock_bundle.chain[parent_idx].guard;
+
+        match guard.insert_entry_after_child(
+            level,
+            ChildPointer::Leaf(left_leaf),
+            pivot_key,
+            ChildPointer::Leaf(right_leaf),
+        ) {
+            Ok(()) => Ok(()),
+            Err(QSError::NodeFull) => {
+                let split = self.db.inner_nodes.split_inner_node(
+                    guard,
+                    level,
+                    ChildPointer::Leaf(left_leaf),
+                    pivot_key,
+                    ChildPointer::Leaf(right_leaf),
+                )?;
+
+                let pending = PendingParentSplit {
+                    left_child: ChildPointer::Inner(guard.node_id()),
+                    pivot_key: split.pivot_key,
+                    right_child: ChildPointer::Inner(split.right_node),
+                    child_level: level,
+                };
+
+                self.bubble_split_up(lock_bundle, parent_idx, pending)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn bubble_split_up(
+        &mut self,
+        lock_bundle: &mut WriteLockBundle<'db>,
+        mut idx: usize,
+        mut pending: PendingParentSplit,
+    ) -> Result<(), QSError> {
+        while idx > 0 {
+            idx -= 1;
+            let level = lock_bundle.chain[idx].level;
+            let guard = &mut lock_bundle.chain[idx].guard;
+            match guard.insert_entry_after_child(
+                level,
+                pending.left_child,
+                &pending.pivot_key,
+                pending.right_child,
+            ) {
+                Ok(()) => return Ok(()),
+                Err(QSError::NodeFull) => {
+                    let split = self.db.inner_nodes.split_inner_node(
+                        guard,
+                        level,
+                        pending.left_child,
+                        &pending.pivot_key,
+                        pending.right_child,
+                    )?;
+
+                    pending = PendingParentSplit {
+                        left_child: ChildPointer::Inner(guard.node_id()),
+                        pivot_key: split.pivot_key,
+                        right_child: ChildPointer::Inner(split.right_node),
+                        child_level: level,
+                    };
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        let root_lock = lock_bundle
+            .root_lock
+            .as_mut()
+            .expect("root lock must exist for cascading split");
+        self.db.inner_nodes.promote_inner_root(
+            root_lock,
+            pending.left_child.as_inner(),
+            pending.right_child.as_inner(),
+            &pending.pivot_key,
+            pending.child_level,
+        )
+    }
+}
+
+struct PendingParentSplit {
+    left_child: ChildPointer,
+    pivot_key: Vec<u8>,
+    right_child: ChildPointer,
+    child_level: u16,
 }
 
 fn collect_user_keys(meta: &NodeMeta) -> Vec<Vec<u8>> {

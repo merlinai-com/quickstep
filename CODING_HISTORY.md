@@ -2,6 +2,14 @@
 
 # Coding History
 
+#### 2025-11-22 14:15 UTC [pending] [main]
+
+- Introduced `ChildPointer` + `LockedInner` so write-lock bundles retain level + node IDs; `BPNode` now has shared helpers for resetting/appending entries regardless of child type.
+- Added `BPTree::split_inner_node`, `promote_inner_root`, and `QuickStepTx::bubble_split_up`, enabling cascading splits that allocate new inner siblings and promote the root when necessary.
+- Exposed `QuickStep::debug_root_level` plus richer split events (`pivot_key`, `left_count`, `right_count`) to audit tree height changes.
+- Added `tests/quickstep_split.rs::root_parent_splits_and_promotes_new_inner_level` to stress the tree until a level ≥2 root forms; reran `cargo test quickstep_split`.
+- Documentation refresh: `design/detailed-plan.md` Parent/Testing sections explain the new plumbing, and README status bullets call out cascading split support.
+
 #### 2025-11-22 13:05 UTC [pending] [main]
 
 - Added split instrumentation in `src/debug.rs` (`SplitEvent` log + `debug::split_events()`) and rewired `QuickStepTx::put` to record the logical left/right page IDs whenever a leaf split completes.

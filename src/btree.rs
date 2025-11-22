@@ -11,7 +11,7 @@ use std::{
 use crate::{
     error::QSError,
     map_table::PageId,
-    utils::{extract_u32, extract_u48, store_u48},
+    utils::{extract_u32, extract_u48, store_u32, store_u48},
     SPIN_RETRIES,
 };
 
@@ -101,6 +101,28 @@ impl BPTree {
         Ok(())
     }
 
+    pub fn promote_inner_root(
+        &self,
+        root_lock: &mut RootWriteLock<'_>,
+        left_child: BPNodeId,
+        right_child: BPNodeId,
+        pivot_key: &[u8],
+        child_level: u16,
+    ) -> Result<(), QSError> {
+        let new_level = child_level + 1;
+        let node_id = self.alloc_inner_node()?;
+
+        unsafe {
+            let node_ptr = self.slab.as_ptr().add(node_id.0 as usize);
+            let node = &mut *node_ptr;
+            node.reset_for_level(new_level, ChildPointer::Inner(left_child));
+            node.append_entry_for_level(new_level, pivot_key, ChildPointer::Inner(right_child))?;
+        }
+
+        root_lock.set_inner(node_id, new_level);
+        Ok(())
+    }
+
     pub fn read_root(&self) -> Result<RootReadLock<'_>, BPRestart> {
         let version = self.root_vlock.load(Ordering::Acquire);
         if is_locked_or_obsolete(version) {
@@ -127,22 +149,23 @@ impl BPTree {
         }
     }
 
-    pub fn read_inner(&self, node: BPNodeId) -> Result<InnerReadGuard<'_>, BPRestart> {
-        let node = unsafe { self.slab.add(node.0 as usize).as_ref() };
+    pub fn read_inner(&self, node_id: BPNodeId) -> Result<InnerReadGuard<'_>, BPRestart> {
+        let node_ptr = unsafe { self.slab.add(node_id.0 as usize).as_ref() };
 
-        let version = node.vlock.load(Ordering::Acquire);
+        let version = node_ptr.vlock.load(Ordering::Acquire);
 
         match is_locked_or_obsolete(version) {
             true => Err(BPRestart),
             false => Ok(InnerReadGuard {
                 version,
-                node: node.into(),
+                node: node_ptr.into(),
+                node_id,
                 _marker: PhantomData,
             }),
         }
     }
-    pub fn write_inner(&self, node: BPNodeId) -> Result<InnerWriteGuard<'_>, BPRestart> {
-        let read = self.read_inner(node)?;
+    pub fn write_inner(&self, node_id: BPNodeId) -> Result<InnerWriteGuard<'_>, BPRestart> {
+        let read = self.read_inner(node_id)?;
         read.upgrade()
     }
 
@@ -293,17 +316,72 @@ impl BPTree {
         while level > 1 {
             let next = unsafe { guard.as_ref().search_for_inner(key) };
             let next_guard = self.write_inner(next)?;
-            // don't need to check because we have exclusive access to parent
-            acc.push(guard);
+            acc.push(LockedInner { level, guard });
             guard = next_guard;
             level -= 1;
         }
 
-        acc.push(guard);
+        acc.push(LockedInner { level, guard });
 
         Ok(WriteLockBundle {
             root_lock,
             chain: acc,
+        })
+    }
+
+    pub(crate) fn split_inner_node(
+        &self,
+        guard: &mut InnerWriteGuard<'_>,
+        level: u16,
+        left_child: ChildPointer,
+        pivot_key: &[u8],
+        right_child: ChildPointer,
+    ) -> Result<InnerSplitPropagation, QSError> {
+        let lowest_child = guard.as_ref().lowest_child_for_level(level);
+        let mut entries = Vec::with_capacity(guard.as_ref().count as usize + 1);
+        for idx in 0..guard.as_ref().count {
+            let key = guard.as_ref().get_key(idx).to_vec();
+            let child = guard.as_ref().get_child_for_level(idx, level);
+            entries.push((key, child));
+        }
+
+        let insert_idx = if left_child == lowest_child {
+            0
+        } else {
+            entries
+                .iter()
+                .position(|(_, child)| *child == left_child)
+                .map(|pos| pos + 1)
+                .ok_or(QSError::ParentChildMissing)?
+        };
+        entries.insert(insert_idx, (pivot_key.to_vec(), right_child));
+
+        let promote_idx = entries.len() / 2;
+        let promote_entry = entries.remove(promote_idx);
+        let promote_key = promote_entry.0.clone();
+        let right_lowest = promote_entry.1;
+
+        let right_entries = entries.split_off(promote_idx);
+        let left_entries = entries;
+
+        let right_node_id = self.alloc_inner_node()?;
+        let right_node_ptr = unsafe { self.slab.as_ptr().add(right_node_id.0 as usize) };
+        let right_node = unsafe { &mut *right_node_ptr };
+
+        let left_node = guard.as_mut();
+        left_node.reset_for_level(level, lowest_child);
+        for (key, child) in left_entries {
+            left_node.append_entry_for_level(level, &key, child)?;
+        }
+
+        right_node.reset_for_level(level, right_lowest);
+        for (key, child) in right_entries {
+            right_node.append_entry_for_level(level, &key, child)?;
+        }
+
+        Ok(InnerSplitPropagation {
+            pivot_key: promote_key,
+            right_node: right_node_id,
         })
     }
 
@@ -328,6 +406,18 @@ impl BPTree {
         };
         root_guard.unlock_or_restart().ok()?;
         snapshot
+    }
+
+    pub fn root_level(&self) -> u16 {
+        let Ok(root_guard) = self.read_root() else {
+            return 0;
+        };
+        let level = match root_guard.get_root() {
+            BPRootInfo::Leaf(_) => 0,
+            BPRootInfo::Inner { level, .. } => level.get(),
+        };
+        root_guard.unlock_or_restart().ok();
+        level
     }
 }
 
@@ -416,6 +506,7 @@ fn update_lock_points<'a>(
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct BPNodeId(u32);
 
@@ -441,9 +532,41 @@ pub enum WriteLockPoint<'a> {
     },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ChildPointer {
+    Leaf(PageId),
+    Inner(BPNodeId),
+}
+
+impl ChildPointer {
+    pub fn as_leaf(&self) -> PageId {
+        match self {
+            ChildPointer::Leaf(id) => *id,
+            ChildPointer::Inner(_) => panic!("expected leaf child pointer"),
+        }
+    }
+
+    pub fn as_inner(&self) -> BPNodeId {
+        match self {
+            ChildPointer::Inner(id) => *id,
+            ChildPointer::Leaf(_) => panic!("expected inner child pointer"),
+        }
+    }
+}
+
 pub struct WriteLockBundle<'a> {
     pub root_lock: Option<RootWriteLock<'a>>,
-    pub chain: Vec<InnerWriteGuard<'a>>,
+    pub chain: Vec<LockedInner<'a>>,
+}
+
+pub struct InnerSplitPropagation {
+    pub pivot_key: Vec<u8>,
+    pub right_node: BPNodeId,
+}
+
+pub struct LockedInner<'a> {
+    pub level: u16,
+    pub guard: InnerWriteGuard<'a>,
 }
 
 pub enum BPRootInfo {
@@ -465,6 +588,7 @@ pub struct DebugLeafParent {
 pub struct InnerReadGuard<'a> {
     version: u64,
     node: NonNull<BPNode>,
+    node_id: BPNodeId,
     _marker: PhantomData<&'a BPNode>,
 }
 
@@ -484,6 +608,7 @@ impl<'a> InnerReadGuard<'a> {
         ) {
             Ok(_) => Ok(InnerWriteGuard {
                 node: unsafe { &mut *self.node.as_ptr() },
+                node_id: self.node_id,
             }),
             Err(_v) => Err(BPRestart),
         }
@@ -505,6 +630,7 @@ impl<'a> InnerReadGuard<'a> {
 
 pub struct InnerWriteGuard<'a> {
     node: &'a mut BPNode,
+    node_id: BPNodeId,
 }
 
 impl<'a> InnerWriteGuard<'a> {
@@ -514,6 +640,21 @@ impl<'a> InnerWriteGuard<'a> {
 
     pub fn as_mut(&mut self) -> &mut BPNode {
         self.node
+    }
+
+    pub fn node_id(&self) -> BPNodeId {
+        self.node_id
+    }
+
+    pub fn insert_entry_after_child(
+        &mut self,
+        level: u16,
+        left_child: ChildPointer,
+        pivot_key: &[u8],
+        right_child: ChildPointer,
+    ) -> Result<(), QSError> {
+        self.node
+            .insert_entry_after_child(level, left_child, pivot_key, right_child)
     }
 }
 
@@ -550,6 +691,12 @@ impl BPNode {
         self.count = 0;
         self.alloc_idx = INLINE_BUFFER_LEN as u32 - 1;
         self.lowest = lowest_child.0;
+    }
+
+    fn reset_inner_parent(&mut self, lowest_child: BPNodeId) {
+        self.count = 0;
+        self.alloc_idx = INLINE_BUFFER_LEN as u32 - 1;
+        self.lowest = lowest_child.0 as u64;
     }
 
     fn append_leaf_entry(&mut self, key: &[u8], child: PageId) -> Result<(), QSError> {
@@ -589,11 +736,88 @@ impl BPNode {
         Ok(())
     }
 
+    fn append_inner_entry(&mut self, key: &[u8], child: BPNodeId) -> Result<(), QSError> {
+        if key.len() > MAX_KEY_LENGTH {
+            return Err(QSError::KeyTooLarge);
+        }
+
+        let needed = key.len() + 4;
+        let meta_cost = size_of::<BPKVMeta>();
+        if self.space_left() < needed + meta_cost {
+            return Err(QSError::NodeFull);
+        }
+
+        self.alloc_idx = self
+            .alloc_idx
+            .checked_sub(needed as u32)
+            .ok_or(QSError::NodeFull)?;
+
+        let key_start = self.alloc_idx as usize + 1;
+        let child_start = key_start + key.len();
+
+        self.rest[key_start..key_start + key.len()].copy_from_slice(key);
+        let child_bytes = store_u32(child.0 as u64);
+        self.rest[child_start..child_start + 4].copy_from_slice(&child_bytes);
+
+        let meta = BPKVMeta {
+            start_offset: key_start as u16,
+            key_len: key.len() as u16,
+        };
+
+        let meta_ptr = self.rest.as_mut_ptr() as *mut BPKVMeta;
+        unsafe {
+            meta_ptr.add(self.count as usize).write(meta);
+        }
+
+        self.count += 1;
+        Ok(())
+    }
+
+    fn append_entry_for_level(
+        &mut self,
+        level: u16,
+        key: &[u8],
+        child: ChildPointer,
+    ) -> Result<(), QSError> {
+        match level {
+            1 => self.append_leaf_entry(key, child.as_leaf()),
+            _ => self.append_inner_entry(key, child.as_inner()),
+        }
+    }
+
+    fn reset_for_level(&mut self, level: u16, lowest_child: ChildPointer) {
+        match level {
+            1 => self.reset_leaf_parent(lowest_child.as_leaf()),
+            _ => self.reset_inner_parent(lowest_child.as_inner()),
+        }
+    }
+
     fn get_leaf_child(&self, idx: u32) -> PageId {
         let meta = self.get_meta(idx);
         let child_offset = meta.start_offset as usize + meta.key_len as usize;
         let child_ptr = unsafe { self.rest.as_ptr().add(child_offset) };
         PageId(extract_u48(child_ptr))
+    }
+
+    fn get_inner_child(&self, idx: u32) -> BPNodeId {
+        let meta = self.get_meta(idx);
+        let child_offset = meta.start_offset as usize + meta.key_len as usize;
+        let child_ptr = unsafe { self.rest.as_ptr().add(child_offset) };
+        BPNodeId(extract_u32(child_ptr))
+    }
+
+    fn lowest_child_for_level(&self, level: u16) -> ChildPointer {
+        match level {
+            1 => ChildPointer::Leaf(PageId(self.lowest)),
+            _ => ChildPointer::Inner(BPNodeId(self.lowest as u32)),
+        }
+    }
+
+    fn get_child_for_level(&self, idx: u32, level: u16) -> ChildPointer {
+        match level {
+            1 => ChildPointer::Leaf(self.get_leaf_child(idx)),
+            _ => ChildPointer::Inner(self.get_inner_child(idx)),
+        }
     }
 
     pub fn insert_leaf_entry_after_child(
@@ -602,29 +826,44 @@ impl BPNode {
         pivot_key: &[u8],
         right_child: PageId,
     ) -> Result<(), QSError> {
-        let lowest_child = PageId(self.lowest);
+        self.insert_entry_after_child(
+            1,
+            ChildPointer::Leaf(left_child),
+            pivot_key,
+            ChildPointer::Leaf(right_child),
+        )
+    }
+
+    fn insert_entry_after_child(
+        &mut self,
+        level: u16,
+        left_child: ChildPointer,
+        pivot_key: &[u8],
+        right_child: ChildPointer,
+    ) -> Result<(), QSError> {
+        let lowest_child = self.lowest_child_for_level(level);
         let mut entries = Vec::with_capacity(self.count as usize + 1);
         for idx in 0..self.count {
             let key = self.get_key(idx).to_vec();
-            let child = self.get_leaf_child(idx);
+            let child = self.get_child_for_level(idx, level);
             entries.push((key, child));
         }
 
-        let insert_idx = if left_child.0 == lowest_child.0 {
+        let insert_idx = if left_child == lowest_child {
             0
         } else {
             entries
                 .iter()
-                .position(|(_, child)| child.0 == left_child.0)
+                .position(|(_, child)| *child == left_child)
                 .map(|pos| pos + 1)
                 .ok_or(QSError::ParentChildMissing)?
         };
 
         entries.insert(insert_idx, (pivot_key.to_vec(), right_child));
 
-        self.reset_leaf_parent(lowest_child);
+        self.reset_for_level(level, lowest_child);
         for (key, child) in entries {
-            self.append_leaf_entry(&key, child)?;
+            self.append_entry_for_level(level, &key, child)?;
         }
 
         Ok(())

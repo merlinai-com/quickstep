@@ -59,8 +59,7 @@ fn root_split_occurs_and_is_readable() {
     );
     let pivot = snapshot.pivots[0].clone();
     assert_eq!(
-        events[0].pivot_key,
-        pivot,
+        events[0].pivot_key, pivot,
         "instrumented pivot should match the root pivot"
     );
     let left_snapshot = db
@@ -269,13 +268,11 @@ fn second_split_under_root_adds_third_child() {
     let low_pivot = snapshot.pivots[0].clone();
     let high_pivot = snapshot.pivots[1].clone();
     assert_eq!(
-        events[0].pivot_key,
-        low_pivot,
+        events[0].pivot_key, low_pivot,
         "first split pivot should match snapshot"
     );
     assert_eq!(
-        events[1].pivot_key,
-        high_pivot,
+        events[1].pivot_key, high_pivot,
         "second split pivot should match snapshot"
     );
     let left_snapshot = db
@@ -338,6 +335,36 @@ fn second_split_under_root_adds_third_child() {
         );
     }
     read_tx.commit();
+}
+
+#[test]
+fn root_parent_splits_and_promotes_new_inner_level() {
+    debug::reset_debug_counters();
+    let db = new_db();
+    let payload = vec![0u8; 512];
+    let mut inserted = 0usize;
+
+    while db.debug_root_level() < 2 {
+        {
+            let mut tx = db.tx();
+            for _ in 0..32 {
+                let key = format!("deep-key-{inserted:05}");
+                tx.put(key.as_bytes(), &payload)
+                    .expect("insert while stressing inner nodes");
+                inserted += 1;
+            }
+            tx.commit();
+        }
+        assert!(
+            inserted < 20_000,
+            "expected inner root promotion after reasonable number of inserts"
+        );
+    }
+
+    assert!(
+        db.debug_root_level() >= 2,
+        "root level should be at least 2 after parent split"
+    );
 }
 
 fn parse_key_index(key: &[u8]) -> u32 {

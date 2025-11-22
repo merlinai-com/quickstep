@@ -181,7 +181,7 @@ impl MapTable {
 }
 
 /// An id of a leaf page, representing an index into the mapping table
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PageId(pub(crate) u64);
 
 impl PageId {

@@ -1,5 +1,15 @@
 # Changelog
 
+#### 2025-11-22 14:15 UTC [pending] [main]
+
+##### Phase 1.3 cascading parent splits + root promotion test
+
+- Added `ChildPointer`, `LockedInner`, and node-ID tracking so each ancestor lock knows its tree level; `BPNode::insert_entry_after_child` now works for both leaf and inner children.
+- Implemented `BPTree::split_inner_node`, `promote_inner_root`, and `QuickStepTx::bubble_split_up`, enabling cascading splits to rebuild ancestors and promote a taller root.
+- Recorded split metadata with pivot key plus `(left_count, right_count)` in `debug::SplitEvent`, and added `QuickStep::debug_root_level` to expose current tree height.
+- Extended `tests/quickstep_split.rs` with `root_parent_splits_and_promotes_new_inner_level`, ensuring multi-level trees form correctly; re-ran `cargo test quickstep_split`.
+- Documentation: `design/detailed-plan.md` Parent/Testing sections now describe cascading splits, and the README status table reflects the new capabilities.
+
 #### 2025-11-22 13:05 UTC [pending] [main]
 
 ##### Phase 1.3 split instrumentation + depth-1 cascading test
