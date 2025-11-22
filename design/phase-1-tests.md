@@ -66,7 +66,7 @@ Each subsection lists three things:
 - Consider a helper that dumps tree structure for debugging (only compiled in tests).
 
 ### Current results
-- **Pending** – split/merge logic not yet implemented, so tests are blocked until Phase 1.3 coding starts.
+- **PASS** – `tests/quickstep_fence_keys.rs` exercises root splits, merge survivors, eviction flushes, and delete-triggered auto merges using the public API. Each scenario asserts the lower/upper fences still cover the resident keys (including the sentinel `[0x00]/[0xFF]` root case). Command: `cargo test quickstep_fence_keys`. Compiler warnings remain (unused imports/todo stubs) but do not affect correctness.
 
 ---
 
@@ -84,7 +84,11 @@ Each subsection lists three things:
 - If needed, expose a debug API (only compiled in tests) to read fence data without relying on `todo!()` areas.
 
 ### Current results
-- **Pending** – awaiting completion of the fence-key `todo!()` blocks.
+- Partially covered via the WAL persistence suite:
+  - `tests/quickstep_delete_persist.rs::wal_records_include_fence_bounds` proves WAL entries capture the current `[lower, upper]` bounds.
+  - `tests/quickstep_delete_persist.rs::wal_replay_survives_merge_crash` bulk-loads keys, triggers a split and auto-merge, then replays the WAL to ensure fence ranges remain valid.
+  - `tests/quickstep_delete_persist.rs::wal_checkpoint_drops_only_target_page` verifies the new PageId-based WAL framing (length-prefixed groups) by checkpointing one page and ensuring the other page’s entries persist.
+- Outstanding: add a deterministic “cached vs evicted sibling” replay test once we expose a debug eviction helper (tracked in §1.4 of the detailed plan).
 
 ---
 
