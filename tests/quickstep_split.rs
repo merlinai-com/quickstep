@@ -91,6 +91,93 @@ fn root_split_occurs_and_is_readable() {
 }
 
 #[test]
+fn post_split_inserts_route_to_expected_children() {
+    debug::reset_debug_counters();
+    let db = new_db();
+    let payload = vec![0u8; 1024];
+    let mut inserted = 0usize;
+
+    {
+        let mut tx = db.tx();
+        while debug::split_requests() == 0 {
+            assert!(inserted < 128, "expected a root split within 128 inserts");
+            let key = format!("key-{inserted:04}");
+            tx.put(key.as_bytes(), &payload)
+                .expect("insert before split");
+            inserted += 1;
+        }
+        tx.commit();
+    }
+
+    assert_eq!(debug::split_requests(), 1);
+    let snapshot = db
+        .debug_root_leaf_parent()
+        .expect("root should have been promoted");
+    let pivot = snapshot.pivots[0].clone();
+    let pivot_idx = parse_key_index(&pivot);
+    assert!(
+        pivot_idx > 0,
+        "split pivot must be greater than zero for range tests"
+    );
+    let left_key = format!("key-{:04}-lo", pivot_idx - 1);
+    let right_key = format!("key-{:04}-hi", pivot_idx + 1);
+
+    {
+        let mut tx = db.tx();
+        tx.put(left_key.as_bytes(), &payload)
+            .expect("left-side insert after split");
+        tx.put(right_key.as_bytes(), &payload)
+            .expect("right-side insert after split");
+        tx.commit();
+    }
+    assert_eq!(
+        debug::split_requests(),
+        1,
+        "follow-up inserts should not trigger extra splits"
+    );
+
+    let snapshot = db
+        .debug_root_leaf_parent()
+        .expect("root should remain an inner node");
+    assert_eq!(snapshot.children.len(), 2);
+    let left_child = snapshot.children[0];
+    let right_child = snapshot.children[1];
+
+    let left_snapshot = db
+        .debug_leaf_snapshot(left_child)
+        .expect("left child snapshot");
+    let right_snapshot = db
+        .debug_leaf_snapshot(right_child)
+        .expect("right child snapshot");
+
+    assert!(
+        left_snapshot
+            .keys
+            .iter()
+            .any(|key| key.as_slice() == left_key.as_bytes()),
+        "left child should contain the left-side insert"
+    );
+    assert!(
+        right_snapshot
+            .keys
+            .iter()
+            .any(|key| key.as_slice() == right_key.as_bytes()),
+        "right child should contain the right-side insert"
+    );
+
+    let mut read_tx = db.tx();
+    assert!(
+        read_tx.get(left_key.as_bytes()).unwrap().is_some(),
+        "left-side key should be readable after routing"
+    );
+    assert!(
+        read_tx.get(right_key.as_bytes()).unwrap().is_some(),
+        "right-side key should be readable after routing"
+    );
+    read_tx.commit();
+}
+
+#[test]
 fn second_split_under_root_adds_third_child() {
     debug::reset_debug_counters();
     let db = new_db();
@@ -208,4 +295,13 @@ fn second_split_under_root_adds_third_child() {
         );
     }
     read_tx.commit();
+}
+
+fn parse_key_index(key: &[u8]) -> u32 {
+    let key_str = std::str::from_utf8(key).expect("utf8 key");
+    let digits = key_str
+        .strip_prefix("key-")
+        .expect("key should start with 'key-'");
+    let numeric = &digits[..4];
+    numeric.parse().expect("parse key digits")
 }

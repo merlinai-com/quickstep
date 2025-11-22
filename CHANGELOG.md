@@ -19,6 +19,14 @@
 - Updated `design/detailed-plan.md` Testing/Parent sections to call out the new helper + data validation step.
 - Tests: `cargo test quickstep_split`.
 
+#### 2025-11-22 13:55 UTC [pending] [main]
+
+##### Phase 1.3 post-split routing test
+
+- Added `tests/quickstep_split.rs::post_split_inserts_route_to_expected_children`, which inserts fresh keys on either side of the recorded pivot after the first split and proves (via `debug_leaf_snapshot`) that they land in the expected child without triggering another split.
+- Documented the new negative-routing coverage in `design/detailed-plan.md`.
+- Tests: `cargo test quickstep_split`.
+
 #### 2025-11-22 10:45 UTC [pending] [main]
 
 ##### Phase 1.3 bootstrap hardening + node fixes

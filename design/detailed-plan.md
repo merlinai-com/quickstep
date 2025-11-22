@@ -103,6 +103,7 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
      1. Fills the tree until the second split fires under the promoted root, ensuring parent insertion rebuilds the inner node with three children.
      2. Asserts the split log recorded distinct left-page IDs for the first and second splits (page 0 vs the right child) and that `debug_root_leaf_parent()` now shows three children / two pivots.
      3. Re-reads every inserted key to prove the new routing logic is stable.
+   - ✅ Added `tests/quickstep_split.rs::post_split_inserts_route_to_expected_children`, which inserts new keys on both sides of the recorded pivot after the first split and proves they land in the correct leaf (via `debug_leaf_snapshot`) without triggering extra splits.
    - ✅ Split instrumentation is now exposed via `debug::split_events()` so future cascading tests can assert exactly which logical leaf split; additional scenarios can build atop this without new hooks.
    - ✅ Leaf snapshots + pivot assertions now verify that every child’s key range is consistent with the recorded pivots after each split, closing the gap between structural and data validation.
 

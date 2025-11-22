@@ -16,6 +16,12 @@
 - Updated `design/detailed-plan.md` (Phase 1.3 Testing/Parent bullets) to capture the new helper + stronger assertions.
 - Tests: `cargo test quickstep_split`.
 
+#### 2025-11-22 13:55 UTC [pending] [main]
+
+- Added `tests/quickstep_split.rs::post_split_inserts_route_to_expected_children`, which inserts new keys on both sides of the recorded pivot after the first split and proves (via `debug_leaf_snapshot`) that they land in the expected leaf without triggering extra splits.
+- Documented the new routing test in `design/detailed-plan.md`.
+- Tests: `cargo test quickstep_split`.
+
 #### 2025-11-22 10:45 UTC [pending] [main]
 
 - Formatted the on-disk root leaf during `QuickStep::new()` so page 0 always contains the sentinel fence keys before any transaction runs; promotion now copies the disk image verbatim into a mini-page and simply re-points the map-table entry.
