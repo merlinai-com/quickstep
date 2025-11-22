@@ -777,7 +777,7 @@ impl<'db> QuickStepTx<'db> {
             NodeRef::Leaf(_) => unreachable!("mini page expected after promotion"),
         };
         let meta = unsafe { self.db.cache.get_meta_mut(index) };
-        let removed = meta.remove_key(key);
+        let removed = meta.mark_tombstone(key);
         if !removed {
             return Ok(false);
         }

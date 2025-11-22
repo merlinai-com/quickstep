@@ -115,19 +115,35 @@ impl NodeMeta {
     }
 
     pub fn user_entry_count(&self) -> usize {
-        self.record_count().saturating_sub(2) as usize
+        self.entries()
+            .filter(|entry| entry.meta.typ().exists())
+            .count()
     }
 
-    pub fn remove_key(&mut self, key: &[u8]) -> bool {
+    pub fn mark_tombstone(&mut self, key: &[u8]) -> bool {
         let prefix = self.get_node_prefix();
         if !key.starts_with(prefix) {
             return false;
         }
         let suffix = &key[prefix.len()..];
         match self.binary_search(suffix) {
-            Ok(idx) => self.remove_entry(idx),
+            Ok(idx) => self.mark_entry_tombstone(idx),
             Err(_) => false,
         }
+    }
+
+    pub fn remove_entry_at(&mut self, idx: usize) {
+        self.remove_entry(idx);
+    }
+
+    fn mark_entry_tombstone(&mut self, idx: usize) -> bool {
+        let mut kv = self.get_kv_meta(idx);
+        if kv.fence() || !kv.typ().exists() {
+            return false;
+        }
+        kv = kv.set_record_type(KVRecordType::Tombstone);
+        self.set_kv_meta(idx, kv);
+        true
     }
 
     fn remove_entry(&mut self, idx: usize) -> bool {

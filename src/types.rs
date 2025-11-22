@@ -103,6 +103,14 @@ impl KVMeta {
         self
     }
 
+    #[inline]
+    pub fn set_record_type(mut self, typ: KVRecordType) -> KVMeta {
+        const MASK: u64 = 0b11 << 18;
+        self.0 &= !MASK;
+        self.0 |= (typ as u64) << 18;
+        self
+    }
+
     /// get 2 lookahead bytes of the key, after the common page prefix
     #[inline]
     pub fn look_ahead(&self) -> u16 {
@@ -391,17 +399,18 @@ impl<'a> Iterator for LeafEntryIter<'a> {
     type Item = LeafEntry<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.idx >= self.end {
-            return None;
+        while self.idx < self.end {
+            let meta = self.node.get_kv_meta(self.idx);
+            self.idx += 1;
+            if !meta.typ().exists() {
+                continue;
+            }
+            return Some(LeafEntry {
+                meta,
+                key_suffix: self.node.get_stored_key_from_meta(meta),
+                value: self.node.get_val_from_meta(meta),
+            });
         }
-
-        let meta = self.node.get_kv_meta(self.idx);
-        self.idx += 1;
-
-        Some(LeafEntry {
-            meta,
-            key_suffix: self.node.get_stored_key_from_meta(meta),
-            value: self.node.get_val_from_meta(meta),
-        })
+        None
     }
 }

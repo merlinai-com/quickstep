@@ -2,6 +2,12 @@
 
 # Coding History
 
+#### 2025-11-22 15:40 UTC [pending] [main]
+
+- Added tombstone-aware delete support: `NodeMeta` can mark entries as tombstones, `flush_dirty_entries` removes them from disk on eviction, and `QuickStep::delete` now relies on tombstones plus auto-merge thresholds rather than immediate physical removal.
+- Cascading merge logic now walks the entire parent chain so delete-triggered merges collapse inner nodes and demote the root when necessary.
+- Tests: `cargo test quickstep_merge`.
+
 #### 2025-11-22 15:05 UTC [pending] [main]
 
 - Added `LeafMergePlan`/`LeafMergeOutcome` plus `debug::MergeEvent` instrumentation so survivor leaves can rebuild themselves while we log the reclaimed page IDs + merged counts.

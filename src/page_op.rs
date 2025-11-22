@@ -153,29 +153,50 @@ impl LeafMergePlan {
     }
 }
 
-pub fn flush_dirty_entries(node_meta: &NodeMeta, io_engine: &IoEngine) {
+pub fn flush_dirty_entries(node_meta: &mut NodeMeta, io_engine: &IoEngine) {
     let mut disk_leaf: Option<DiskLeaf> = None;
     let leaf_addr = node_meta.leaf();
+    let mut tombstones = Vec::new();
+
     let cnt = node_meta.record_count() as usize;
     for i in 0..cnt {
         let kv = node_meta.get_kv_meta(i);
 
-        if kv.fence() || !kv.typ().is_dirty() {
+        if kv.fence() {
             continue;
         }
 
-        let entry = disk_leaf.get_or_insert_with(|| io_engine.get_page(leaf_addr));
-        let key_suffix = node_meta.get_stored_key_from_meta(kv);
-        let val = node_meta.get_val_from_meta(kv);
+        match kv.typ() {
+            crate::types::KVRecordType::Tombstone => {
+                let entry = disk_leaf.get_or_insert_with(|| io_engine.get_page(leaf_addr));
+                let prefix = node_meta.get_node_prefix();
+                let suffix = node_meta.get_stored_key_from_meta(kv);
+                let mut key = Vec::with_capacity(prefix.len() + suffix.len());
+                key.extend_from_slice(prefix);
+                key.extend_from_slice(suffix);
+                entry.as_mut().remove_key(&key);
+                tombstones.push(i);
+            }
+            typ if typ.is_dirty() => {
+                let entry = disk_leaf.get_or_insert_with(|| io_engine.get_page(leaf_addr));
+                let key_suffix = node_meta.get_stored_key_from_meta(kv);
+                let val = node_meta.get_val_from_meta(kv);
 
-        entry
-            .as_mut()
-            .try_put_with_suffix(key_suffix, val)
-            .expect("disk leaf should have room for cached entry");
+                entry
+                    .as_mut()
+                    .try_put_with_suffix(key_suffix, val)
+                    .expect("disk leaf should have room for cached entry");
+            }
+            _ => {}
+        }
     }
 
     if let Some(dirty_leaf) = disk_leaf {
         io_engine.write_page(leaf_addr, &dirty_leaf);
+    }
+
+    for idx in tombstones.into_iter().rev() {
+        node_meta.remove_entry_at(idx);
     }
 }
 
@@ -279,7 +300,7 @@ impl<'a> WriteGuardWrapper<'a> {
 
         // SAFETY: we've got a write guard
         // TODO: implement safe method on buffer with page write guard
-        let node_meta = unsafe { buffer.get_meta_ref(index) };
+        let node_meta = unsafe { buffer.get_meta_mut(index) };
 
         flush_dirty_entries(node_meta, io_engine);
     }

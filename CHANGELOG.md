@@ -1,5 +1,16 @@
 # Changelog
 
+# Changelog
+
+#### 2025-11-22 15:40 UTC [pending] [main]
+
+##### Phase 1.3 tombstone deletes + cascading merge fixes
+
+- Added tombstone-aware delete path: `QuickStep::delete` marks entries as tombstones, `NodeMeta` exposes `mark_tombstone`/`remove_entry_at`, and flush logic now removes tombstoned keys from disk before compacting the in-memory leaf.
+- Parent merges now cascade through every ancestor—`remove_parent_after_merge` walks the lock bundle chain and demotes the root when only one child remains—while auto-merge continues to fire below the occupancy threshold.
+- Tests: extended `tests/quickstep_merge.rs` with delete-driven and multi-level cascading cases; re-ran `cargo test quickstep_merge`.
+- Docs (README, detailed plan, roadmap, changelog, coding history) note that deletes exist but WAL/range semantics remain future work.
+
 #### 2025-11-22 15:05 UTC [pending] [main]
 
 ##### Phase 1.3 leaf merge helpers + tests
