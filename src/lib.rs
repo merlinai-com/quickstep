@@ -18,7 +18,7 @@ use crate::{
     io_engine::IoEngine,
     lock_manager::{LockManager, WriteGuardWrapper},
     map_table::{MapTable, PageId},
-    page_op::{LeafSplitOutcome, LeafSplitPlan, TryPutResult},
+    page_op::{LeafMergePlan, LeafSplitOutcome, LeafSplitPlan, TryPutResult},
     types::{NodeMeta, NodeRef, NodeSize},
 };
 
@@ -50,6 +50,8 @@ pub struct QuickStep {
     /// The map from page ids to their location, either in the mini-page buffer or on disk
     map_table: MapTable,
 }
+
+const AUTO_MERGE_MIN_ENTRIES: usize = 3;
 
 #[derive(Debug)]
 pub struct DebugLeafSnapshot {
@@ -201,7 +203,6 @@ impl<'db> QuickStepTx<'db> {
     }
 
     /// Insert or update a value
-    // TODO: return option of slice, representing if there was a value overwritten
     pub fn put<'tx>(&'tx mut self, key: &[u8], val: &[u8]) -> Result<(), QSError> {
         // find leaf, keep track of those that would need to be written to in a split
         let res = self.db.inner_nodes.read_traverse_leaf(key)?;
@@ -386,6 +387,20 @@ impl<'db> QuickStepTx<'db> {
         Ok(())
     }
 
+    fn ensure_mini_page(
+        db: &'db QuickStep,
+        page_guard: &mut WriteGuardWrapper<'db>,
+    ) -> Result<(), QSError> {
+        loop {
+            match page_guard.get_write_guard().node() {
+                NodeRef::MiniPage(_) => return Ok(()),
+                NodeRef::Leaf(addr) => {
+                    Self::promote_leaf_to_mini_page(db, page_guard, addr)?;
+                }
+            }
+        }
+    }
+
     fn new_mini_page(
         &mut self,
         size: NodeSize,
@@ -511,6 +526,106 @@ impl<'db> QuickStepTx<'db> {
             pending.child_level,
         )
     }
+
+    fn merge_leaf_pages(
+        &mut self,
+        left_guard: &mut WriteGuardWrapper<'db>,
+        right_guard: &mut WriteGuardWrapper<'db>,
+        lock_bundle: &mut WriteLockBundle<'db>,
+    ) -> Result<(), QSError> {
+        Self::ensure_mini_page(self.db, left_guard)?;
+        Self::ensure_mini_page(self.db, right_guard)?;
+
+        let left_index = match left_guard.get_write_guard().node() {
+            NodeRef::MiniPage(idx) => idx,
+            NodeRef::Leaf(_) => unreachable!("mini page expected after promotion"),
+        };
+        let right_index = match right_guard.get_write_guard().node() {
+            NodeRef::MiniPage(idx) => idx,
+            NodeRef::Leaf(_) => unreachable!("mini page expected after promotion"),
+        };
+
+        let left_meta = unsafe { self.db.cache.get_meta_mut(left_index) };
+        let right_meta = unsafe { self.db.cache.get_meta_mut(right_index) };
+        let plan = LeafMergePlan::from_nodes(left_meta, right_meta);
+        let outcome = plan
+            .apply(left_meta, right_meta)
+            .map_err(|_| QSError::MergeFailed)?;
+
+        debug::record_merge_event(
+            left_guard.page_id().0,
+            right_guard.page_id().0,
+            outcome.merged_count,
+        );
+
+        self.remove_parent_after_merge(lock_bundle, left_guard.page_id(), right_guard.page_id())
+    }
+
+    fn remove_parent_after_merge(
+        &mut self,
+        lock_bundle: &mut WriteLockBundle<'db>,
+        survivor: PageId,
+        removed: PageId,
+    ) -> Result<(), QSError> {
+        if lock_bundle.chain.is_empty() {
+            return Ok(());
+        }
+
+        let parent_idx = lock_bundle.chain.len() - 1;
+        let level = lock_bundle.chain[parent_idx].level;
+        let guard = &mut lock_bundle.chain[parent_idx].guard;
+        let demote = self.db.inner_nodes.remove_child_after_merge(
+            guard,
+            level,
+            ChildPointer::Leaf(survivor),
+            ChildPointer::Leaf(removed),
+        )?;
+
+        if let Some(mut child) = demote {
+            if parent_idx == 0 {
+                if let Some(ref mut root_lock) = lock_bundle.root_lock {
+                    self.db
+                        .inner_nodes
+                        .demote_root_after_merge(root_lock, child, level)?;
+                }
+                return Ok(());
+            }
+
+            lock_bundle.chain.pop();
+            let mut idx = parent_idx - 1;
+            loop {
+                let parent_level = lock_bundle.chain[idx].level;
+                let guard = &mut lock_bundle.chain[idx].guard;
+                let demotion = self.db.inner_nodes.remove_child_after_merge(
+                    guard,
+                    parent_level,
+                    child,
+                    ChildPointer::Inner(guard.node_id()),
+                )?;
+
+                if let Some(child_ptr) = demotion {
+                    if idx == 0 {
+                        if let Some(ref mut root_lock) = lock_bundle.root_lock {
+                            self.db.inner_nodes.demote_root_after_merge(
+                                root_lock,
+                                child_ptr,
+                                parent_level,
+                            )?;
+                        }
+                        break;
+                    } else {
+                        child = child_ptr;
+                        idx -= 1;
+                        continue;
+                    }
+                } else {
+                    break;
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 struct PendingParentSplit {
@@ -531,4 +646,163 @@ fn collect_user_keys(meta: &NodeMeta) -> Vec<Vec<u8>> {
             key
         })
         .collect()
+}
+
+fn collect_user_records(meta: &NodeMeta) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let prefix = meta.get_node_prefix();
+    meta.entries()
+        .filter(|entry| !entry.meta.fence())
+        .map(|entry| {
+            let mut key = Vec::with_capacity(prefix.len() + entry.key_suffix.len());
+            key.extend_from_slice(prefix);
+            key.extend_from_slice(entry.key_suffix);
+            (key, entry.value.to_vec())
+        })
+        .collect()
+}
+
+impl QuickStep {
+    pub fn debug_truncate_leaf(
+        &self,
+        page_id: PageId,
+        keep: usize,
+        auto_merge: bool,
+    ) -> Result<(), QSError> {
+        let mut tx = self.tx();
+        let res = tx.debug_truncate_leaf(page_id, keep, auto_merge);
+        tx.commit();
+        res
+    }
+
+    pub fn debug_merge_leaves(&self, left: PageId, right: PageId) -> Result<(), QSError> {
+        let mut tx = self.tx();
+        let res = tx.debug_merge_leaves(left, right);
+        tx.commit();
+        res
+    }
+
+    pub fn delete(&self, key: &[u8]) -> Result<bool, QSError> {
+        let mut tx = self.tx();
+        let res = tx.delete(key);
+        tx.commit();
+        res
+    }
+}
+
+impl<'db> QuickStepTx<'db> {
+    pub fn debug_truncate_leaf(
+        &mut self,
+        page_id: PageId,
+        keep: usize,
+        auto_merge: bool,
+    ) -> Result<(), QSError> {
+        let mut guard = self
+            .lock_manager
+            .get_upgrade_or_acquire_write_lock(&self.db.map_table, page_id)?;
+        Self::ensure_mini_page(self.db, &mut guard)?;
+        let index = match guard.get_write_guard().node() {
+            NodeRef::MiniPage(idx) => idx,
+            NodeRef::Leaf(_) => unreachable!("mini page expected after promotion"),
+        };
+        let meta = unsafe { self.db.cache.get_meta_mut(index) };
+        let mut records = collect_user_records(meta);
+        if records.len() <= keep {
+            return Ok(());
+        }
+        records.truncate(keep);
+        meta.reset_user_entries();
+        meta.replay_entries(
+            records
+                .iter()
+                .map(|(key, value)| (key.as_slice(), value.as_slice())),
+        )
+        .map_err(|_| QSError::MergeFailed)?;
+
+        if auto_merge && records.len() <= AUTO_MERGE_MIN_ENTRIES {
+            self.try_auto_merge(page_id)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn debug_merge_leaves(&mut self, left: PageId, right: PageId) -> Result<(), QSError> {
+        let mut left_guard = self
+            .lock_manager
+            .get_upgrade_or_acquire_write_lock(&self.db.map_table, left)?;
+        let mut right_guard = self
+            .lock_manager
+            .get_upgrade_or_acquire_write_lock(&self.db.map_table, right)?;
+        let merge_key = self.first_user_key(&mut left_guard)?;
+        let read_res = self.db.inner_nodes.read_traverse_leaf(&merge_key)?;
+        let lock_bundle =
+            self.db
+                .inner_nodes
+                .write_lock(read_res.underflow_point, OpType::Merge, &merge_key);
+        let mut lock_bundle = lock_bundle?;
+        self.merge_leaf_pages(&mut left_guard, &mut right_guard, &mut lock_bundle)
+    }
+
+    fn try_auto_merge(&mut self, page_id: PageId) -> Result<(), QSError> {
+        let Some(snapshot) = self.db.debug_root_leaf_parent() else {
+            return Ok(());
+        };
+        if snapshot.children.len() < 2 {
+            return Ok(());
+        }
+        let Some(idx) = snapshot.children.iter().position(|child| *child == page_id) else {
+            return Ok(());
+        };
+        let neighbor_idx = if idx + 1 < snapshot.children.len() {
+            idx + 1
+        } else if idx > 0 {
+            idx - 1
+        } else {
+            return Ok(());
+        };
+        let left_idx = neighbor_idx.min(idx);
+        let right_idx = neighbor_idx.max(idx);
+        let left_child = snapshot.children[left_idx];
+        let right_child = snapshot.children[right_idx];
+        self.debug_merge_leaves(left_child, right_child)
+    }
+
+    pub fn delete<'tx>(&'tx mut self, key: &[u8]) -> Result<bool, QSError> {
+        let res = self.db.inner_nodes.read_traverse_leaf(key)?;
+        let mut page_guard = self
+            .lock_manager
+            .get_upgrade_or_acquire_write_lock(&self.db.map_table, res.page)?;
+        Self::ensure_mini_page(self.db, &mut page_guard)?;
+        let index = match page_guard.get_write_guard().node() {
+            NodeRef::MiniPage(idx) => idx,
+            NodeRef::Leaf(_) => unreachable!("mini page expected after promotion"),
+        };
+        let meta = unsafe { self.db.cache.get_meta_mut(index) };
+        let removed = meta.remove_key(key);
+        if !removed {
+            return Ok(false);
+        }
+        if meta.user_entry_count() <= AUTO_MERGE_MIN_ENTRIES {
+            self.try_auto_merge(page_guard.page_id())?;
+        }
+        Ok(true)
+    }
+
+    fn first_user_key(&mut self, guard: &mut WriteGuardWrapper<'db>) -> Result<Vec<u8>, QSError> {
+        Self::ensure_mini_page(self.db, guard)?;
+        let index = match guard.get_write_guard().node() {
+            NodeRef::MiniPage(idx) => idx,
+            NodeRef::Leaf(_) => unreachable!("mini page expected after promotion"),
+        };
+        let meta = unsafe { self.db.cache.get_meta_ref(index) };
+        let prefix = meta.get_node_prefix();
+        meta.entries()
+            .find(|entry| !entry.meta.fence())
+            .map(|entry| {
+                let mut key = Vec::with_capacity(prefix.len() + entry.key_suffix.len());
+                key.extend_from_slice(prefix);
+                key.extend_from_slice(entry.key_suffix);
+                key
+            })
+            .ok_or(QSError::MergeFailed)
+    }
 }

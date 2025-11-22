@@ -114,6 +114,45 @@ pub struct LeafSplitOutcome {
     pub right_count: usize,
 }
 
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct LeafMergePlan {
+    pub entries: Vec<LeafEntryOwned>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub struct LeafMergeOutcome {
+    pub merged_count: usize,
+}
+
+impl LeafMergePlan {
+    pub fn from_nodes(left: &NodeMeta, right: &NodeMeta) -> LeafMergePlan {
+        let mut entries = Vec::new();
+        entries.extend(owned_entries(left));
+        entries.extend(owned_entries(right));
+        LeafMergePlan { entries }
+    }
+
+    pub fn apply(
+        &self,
+        survivor: &mut NodeMeta,
+        removed: &mut NodeMeta,
+    ) -> Result<LeafMergeOutcome, InsufficientSpace> {
+        survivor.reset_user_entries();
+        survivor.replay_entries(
+            self.entries
+                .iter()
+                .map(|entry| (entry.key.as_slice(), entry.value.as_slice())),
+        )?;
+
+        removed.reset_user_entries();
+        Ok(LeafMergeOutcome {
+            merged_count: self.entries.len(),
+        })
+    }
+}
+
 pub fn flush_dirty_entries(node_meta: &NodeMeta, io_engine: &IoEngine) {
     let mut disk_leaf: Option<DiskLeaf> = None;
     let leaf_addr = node_meta.leaf();
@@ -266,4 +305,12 @@ pub enum TryPutResult {
     Success,
     NeedsPromotion(u64),
     NeedsSplit,
+}
+
+fn owned_entries(meta: &NodeMeta) -> Vec<LeafEntryOwned> {
+    let prefix = meta.get_node_prefix();
+    meta.entries()
+        .filter(|entry| !entry.meta.fence())
+        .map(|entry| LeafEntryOwned::from_entry(prefix, &entry))
+        .collect()
 }

@@ -114,6 +114,51 @@ impl NodeMeta {
         self.try_put_with_suffix(key_suffix, val)
     }
 
+    pub fn user_entry_count(&self) -> usize {
+        self.record_count().saturating_sub(2) as usize
+    }
+
+    pub fn remove_key(&mut self, key: &[u8]) -> bool {
+        let prefix = self.get_node_prefix();
+        if !key.starts_with(prefix) {
+            return false;
+        }
+        let suffix = &key[prefix.len()..];
+        match self.binary_search(suffix) {
+            Ok(idx) => self.remove_entry(idx),
+            Err(_) => false,
+        }
+    }
+
+    fn remove_entry(&mut self, idx: usize) -> bool {
+        if idx >= self.record_count() as usize {
+            return false;
+        }
+        let kv = self.get_kv_meta(idx);
+        if kv.fence() {
+            return false;
+        }
+        unsafe {
+            self.erase_kv_in_buffer(kv);
+        }
+        self.shift_meta_left(idx);
+        self.dec_record_count();
+        true
+    }
+
+    fn shift_meta_left(&mut self, idx: usize) {
+        let total = self.record_count() as usize;
+        if idx + 1 >= total {
+            return;
+        }
+        let kv_meta_start = unsafe { (self as *const NodeMeta).add(1) as *mut AtomicU64 };
+        unsafe {
+            kv_meta_start
+                .add(idx + 1)
+                .copy_to(kv_meta_start.add(idx), total - idx - 1);
+        }
+    }
+
     pub fn try_put_with_suffix(
         &mut self,
         key_suffix: &[u8],

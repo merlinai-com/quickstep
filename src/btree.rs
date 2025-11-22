@@ -123,6 +123,31 @@ impl BPTree {
         Ok(())
     }
 
+    pub fn remove_child_after_merge(
+        &self,
+        guard: &mut InnerWriteGuard<'_>,
+        level: u16,
+        survivor: ChildPointer,
+        removed: ChildPointer,
+    ) -> Result<Option<ChildPointer>, QSError> {
+        guard
+            .as_mut()
+            .remove_entry_for_merge(level, survivor, removed)
+    }
+
+    pub fn demote_root_after_merge(
+        &self,
+        root_lock: &mut RootWriteLock<'_>,
+        child: ChildPointer,
+        parent_level: u16,
+    ) -> Result<(), QSError> {
+        match parent_level {
+            1 => root_lock.set_leaf(child.as_leaf()),
+            _ => root_lock.set_inner(child.as_inner(), parent_level - 1),
+        }
+        Ok(())
+    }
+
     pub fn read_root(&self) -> Result<RootReadLock<'_>, BPRestart> {
         let version = self.root_vlock.load(Ordering::Acquire);
         if is_locked_or_obsolete(version) {
@@ -475,6 +500,10 @@ impl<'a> RootWriteLock<'a> {
     fn set_inner(&mut self, node: BPNodeId, level: u16) {
         let encoded = ((level as u64) << 48) | node.0 as u64;
         self.tree.root.store(encoded, Ordering::Release);
+    }
+
+    fn set_leaf(&mut self, page: PageId) {
+        self.tree.root.store(page.0, Ordering::Release);
     }
 }
 
@@ -867,6 +896,51 @@ impl BPNode {
         }
 
         Ok(())
+    }
+
+    fn remove_entry_for_merge(
+        &mut self,
+        level: u16,
+        survivor: ChildPointer,
+        removed: ChildPointer,
+    ) -> Result<Option<ChildPointer>, QSError> {
+        let mut children = Vec::with_capacity(self.count as usize + 1);
+        let mut pivots = Vec::with_capacity(self.count as usize);
+
+        children.push(self.lowest_child_for_level(level));
+        for idx in 0..self.count {
+            pivots.push(self.get_key(idx).to_vec());
+            children.push(self.get_child_for_level(idx, level));
+        }
+
+        let survivor_idx = children
+            .iter()
+            .position(|child| *child == survivor)
+            .ok_or(QSError::ParentChildMissing)?;
+        let removed_idx = children
+            .iter()
+            .position(|child| *child == removed)
+            .ok_or(QSError::ParentChildMissing)?;
+
+        if removed_idx != survivor_idx + 1 {
+            return Err(QSError::ParentChildMissing);
+        }
+
+        children.remove(removed_idx);
+        pivots.remove(removed_idx - 1);
+
+        let new_lowest = children[0];
+        self.reset_for_level(level, new_lowest);
+        for (idx, pivot) in pivots.iter().enumerate() {
+            let child = children[idx + 1];
+            self.append_entry_for_level(level, pivot, child)?;
+        }
+
+        if pivots.is_empty() {
+            Ok(Some(children[0]))
+        } else {
+            Ok(None)
+        }
     }
 
     fn blank() -> BPNode {

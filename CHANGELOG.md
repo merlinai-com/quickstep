@@ -1,5 +1,14 @@
 # Changelog
 
+#### 2025-11-22 15:05 UTC [pending] [main]
+
+##### Phase 1.3 leaf merge helpers + tests
+
+- Added `LeafMergePlan`/`LeafMergeOutcome` to rebuild survivor leaves, reset reclaimed siblings, and return merge stats; `debug::MergeEvent`/`merge_events()` expose the instrumentation.
+- Extended `BPNode`/`BPTree` with `remove_child_after_merge` and root demotion logic so parent pivots get removed and singleton roots collapse to the surviving child.
+- `QuickStep::debug_truncate_leaf` and `QuickStep::debug_merge_leaves` let tests simulate delete-driven underflow; `tests/quickstep_merge.rs` covers both root demotion and “root stays inner” cases.
+- Tests: `cargo test quickstep_merge`.
+
 #### 2025-11-22 14:45 UTC [pending] [main]
 
 ##### Phase 1.3 cache eviction + write-back

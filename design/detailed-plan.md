@@ -102,6 +102,16 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
       - ✅ Added `page_op::flush_dirty_entries` and taught `MiniPageBuffer::evict` to invoke it, flip the map-table entry back to `NodeRef::Leaf`, advance the circular-buffer head, and log eviction events.
       - ✅ `QuickStepTx::new_mini_page` now retries failed allocations by driving eviction, so splits and cascading inserts can proceed even when the cache is saturated.
 
+   5. Merge planning (next up)
+      - ☐ **Trigger semantics**: merges will be initiated after deletes when a leaf drops below a configurable occupancy threshold (default 25%). Until delete exists, we surface an internal helper to exercise the merge machinery via tests.
+      - ✅ **Leaf merge plan**: introduced `LeafMergePlan::from_nodes` to snapshot sibling leaves, validate occupancy, and feed the merge apply path.
+      - ✅ **Apply merge**: `LeafMergePlan::apply` rewrites the survivor via `replay_entries`, resets the reclaimed leaf to fences-only, and returns a `LeafMergeOutcome` for instrumentation.
+      - ✅ **Parent updates**: `BPNode::remove_entry_for_merge` + `BPTree::remove_child_after_merge` drop the pivot/right-child tuple and rebalance the parent; cascading beyond the root remains TODO.
+      - ✅ **Root demotion**: `BPTree::demote_root_after_merge` collapses the root to either a leaf or a smaller inner node when the last pivot disappears.
+      - ✅ **Instrumentation**: added `debug::MergeEvent` / `debug::merge_requests()` so tests can assert the survivor + reclaimed page IDs and merged counts.
+      - ✅ **Delete-trigger**: `QuickStep::delete` and `QuickStepTx::delete` remove keys from leaves, drop record counts, and invoke the auto-merge helper when occupancy falls below the threshold.
+      - ✅ **Tests**: `tests/quickstep_merge.rs` simulates delete-driven merges by truncating leaves, calling the delete API, and verifying both root demotion and “root stays inner but loses a child” scenarios via the new debug helpers.
+
 3. **Testing**
    - ✅ Added `tests/quickstep_split.rs::root_split_occurs_and_is_readable`:
      1. Inserts large payloads until the first split occurs, asserting `debug::split_requests() == 1`.

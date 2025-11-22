@@ -8,6 +8,8 @@ pub enum QSError {
     CacheExhausted,
     /// Internal error while applying a leaf split
     SplitFailed,
+    /// Internal error while applying a leaf merge
+    MergeFailed,
     /// Internal node is full and requires its own split
     NodeFull,
     /// Parent node did not contain expected child pointer

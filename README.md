@@ -84,6 +84,7 @@ cargo doc --open
 - Put/get operations (mini-page promotion + cache writes are in place; cascading parent splits bubble to the root and publish new map-table entries immediately, while merge/eviction policies are still being fleshed out)
 - Leaf split logic (Phase 1.3 now exercises root splits, cascading inner splits, and root promotions via instrumentation-backed integration tests; remaining work focuses on merge handling)
 - Buffer eviction (baseline FIFO eviction flushes dirty mini-pages back to disk and updates the map table in place; second-chance policy & mixed-size freelists are still TODO)
+- Merge logic (leaf-level merge plan, parent rewiring, root demotion, and merge instrumentation are implemented; delete-triggered thresholds and non-root cascading merges are still outstanding)
 - Buffer eviction (structure present, merge-to-disk incomplete)
 - I/O engine (read/write path works; metadata/WAL integration still TBD)
 

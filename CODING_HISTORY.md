@@ -2,6 +2,13 @@
 
 # Coding History
 
+#### 2025-11-22 15:05 UTC [pending] [main]
+
+- Added `LeafMergePlan`/`LeafMergeOutcome` plus `debug::MergeEvent` instrumentation so survivor leaves can rebuild themselves while we log the reclaimed page IDs + merged counts.
+- Extended `BPNode`/`BPTree` with `remove_child_after_merge` and `demote_root_after_merge`; `QuickStepTx` now has internal helpers that merge mini-page siblings and rewrite parent pivots, exposing `debug_truncate_leaf`/`debug_merge_leaves` for tests.
+- New `tests/quickstep_merge.rs` simulates deletes by truncating leaves, then merges siblings to cover both root-demotion and “root stays inner, child count shrinks” paths.
+- Tests: `cargo test quickstep_merge`.
+
 #### 2025-11-22 14:45 UTC [pending] [main]
 
 - Added eviction/liveness bitfields to `NodeMeta`, allowing mini-pages to be marked in-flight, flushed, and reclaimed. `PageWriteGuard` can now rewrite a map-table slot back to `NodeRef::Leaf`.
