@@ -1,5 +1,24 @@
 # Changelog
 
+#### 2025-11-22 14:45 UTC [pending] [main]
+
+##### Phase 1.3 cache eviction + write-back
+
+- Added eviction/liveness bitfields to `NodeMeta`, preventing racing evictions and letting us reclaim mini-page slots deterministically.
+- Introduced `page_op::flush_dirty_entries` and taught `MiniPageBuffer::evict` to flush dirty records, flip the map-table entry back to a disk leaf via `PageWriteGuard::set_leaf`, advance the circular-buffer head, and emit a new `debug::evictions()` counter.
+- `QuickStepTx::new_mini_page` now retries failed allocations by invoking eviction, so root/leaf splits proceed even when the cache only holds a single 4 KiB slot.
+- Tests: new `tests/quickstep_eviction.rs::eviction_flushes_dirty_leaf_to_disk` constrains the cache, forces a split, asserts an eviction occurred, and re-reads every key afterward.
+- Docs: detailed plan + roadmap + README updated to capture the baseline eviction flow; changelog/coding history include the new test and instrumentation.
+
+#### 2025-11-22 14:30 UTC [pending] [main]
+
+##### Phase 1.3 map-table identity wiring
+
+- Fixed `QuickStepTx::apply_leaf_split` so the freshly allocated right leaf keeps its unique `PageId` + disk address: copy-before-rebuild no longer clobbers the header thanks to the new `NodeMeta::set_identity` helper.
+- `DebugLeafSnapshot` now surfaces each leaf’s disk address; split tests assert that every child produced during root and cascading splits persists to a distinct page immediately.
+- Strengthened `tests/quickstep_split.rs` (`root_split_occurs_and_is_readable`, `post_split_inserts_route_to_expected_children`, `second_split_under_root_adds_third_child`) with disk-address checks; map-table wiring is now validated alongside key distribution.
+- Docs: roadmap + detailed plan updated to mark map-table propagation complete, and README reflects that remaining work focuses on merge/eviction plumbing.
+
 #### 2025-11-22 14:15 UTC [pending] [main]
 
 ##### Phase 1.3 cascading parent splits + root promotion test

@@ -15,6 +15,7 @@ pub struct SplitEvent {
 }
 
 static SPLIT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+static EVICTION_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static SPLIT_EVENTS: Mutex<Vec<SplitEvent>> = Mutex::new(Vec::new());
 
 pub fn record_split_event(
@@ -36,8 +37,13 @@ pub fn record_split_event(
     }
 }
 
+pub fn record_eviction() {
+    EVICTION_REQUESTS.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn reset_debug_counters() {
     SPLIT_REQUESTS.store(0, Ordering::Relaxed);
+    EVICTION_REQUESTS.store(0, Ordering::Relaxed);
     let mut guard = match SPLIT_EVENTS.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -54,4 +60,8 @@ pub fn split_events() -> Vec<SplitEvent> {
         Ok(guard) => guard.clone(),
         Err(poison) => poison.into_inner().clone(),
     }
+}
+
+pub fn evictions() -> u64 {
+    EVICTION_REQUESTS.load(Ordering::Relaxed)
 }

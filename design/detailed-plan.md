@@ -93,10 +93,14 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
       - ✅ Implemented `BPNode::insert_entry_after_child` and `split_inner_node`, which rebuild the current inner node, allocate a sibling, and return the propagated pivot/right-child pointer.
       - ✅ Added `BPTree::promote_inner_root` so once the highest inner parent overflows we allocate a brand-new root at `level+1`.
       - ✅ `QuickStepTx::insert_into_parents_after_leaf_split` now updates the immediate parent if space is available, otherwise calls `split_inner_node` and bubbles the resulting pivot upward via `bubble_split_up`.
-      - 🔜 Update `MapTable` + `NodeRef` bookkeeping so the new right leaf becomes reachable immediately after the left leaf is rebuilt (currently still using the temporary post-split refresh).
+      - ✅ Updated `MapTable`/`NodeMeta` identity plumbing so freshly split right leaves retain their unique `PageId` + disk address immediately after rebuild; this removes the temporary post-split refresh hack.
       - ✅ Added a test-only `debug_root_leaf_parent` hook (exposed via `QuickStep`) so integration tests can inspect root fan-out/pivots after a split.
       - ✅ Added `QuickStep::debug_leaf_snapshot`, a read-only helper that materialises the user keys for any leaf page (cached mini-page or on-disk leaf) so tests can assert exact key ranges per child.
       - ✅ Added `QuickStep::debug_root_level` to expose the current tree height for integration tests that stress multi-level promotions.
+   4. Cache eviction + write-back:
+      - ✅ Defined eviction/liveness bitfields on `NodeMeta` so mini-pages can be marked in-flight, converted back to disk leaves, and reclaimed deterministically.
+      - ✅ Added `page_op::flush_dirty_entries` and taught `MiniPageBuffer::evict` to invoke it, flip the map-table entry back to `NodeRef::Leaf`, advance the circular-buffer head, and log eviction events.
+      - ✅ `QuickStepTx::new_mini_page` now retries failed allocations by driving eviction, so splits and cascading inserts can proceed even when the cache is saturated.
 
 3. **Testing**
    - ✅ Added `tests/quickstep_split.rs::root_split_occurs_and_is_readable`:
@@ -110,8 +114,9 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
    - ✅ Added `tests/quickstep_split.rs::post_split_inserts_route_to_expected_children`, which inserts new keys on both sides of the recorded pivot after the first split and proves they land in the correct leaf (via `debug_leaf_snapshot`) without triggering extra splits.
    - ✅ Instrumented pivots/counts (see Pre-flight) are now asserted in the split tests to guarantee the recorded metadata matches the actual leaf contents during and after each split.
    - ✅ Split instrumentation is exposed via `debug::split_events()` so cascading tests can assert exactly which logical leaf split; additional scenarios can build atop this without new hooks.
-   - ✅ Leaf snapshots + pivot assertions now verify that every child’s key range is consistent with the recorded pivots after each split, closing the gap between structural and data validation.
+   - ✅ Leaf snapshots + pivot assertions now verify that every child’s key range is consistent with the recorded pivots after each split, closing the gap between structural and data validation. Snapshots also expose each leaf’s disk address so tests can assert newly created siblings persist to distinct pages immediately after splits.
    - ✅ Added `tests/quickstep_split.rs::root_parent_splits_and_promotes_new_inner_level`, which bulk-loads keys until the root must promote to level ≥2 and asserts `debug_root_level()` reflects the taller tree.
+   - ✅ Added `tests/quickstep_eviction.rs::eviction_flushes_dirty_leaf_to_disk`, which constrains the cache to ~8 KiB, forces a split, asserts `debug::evictions() > 0`, and proves every inserted key remains readable afterward.
 
 4. **Open questions**
    - ✅ Resolved 22 Nov 2025: `QuickStep::new` now formats page 0 on disk (header + sentinel fence keys) before bootstrapping the map table, and every subsequent mini-page allocation calls `ensure_fence_keys` so promotion no longer needs a bootstrap path.

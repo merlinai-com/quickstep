@@ -293,6 +293,13 @@ impl<'a> PageWriteGuard<'a> {
         self.node = entry;
     }
 
+    pub fn set_leaf(&mut self, disk_addr: u64) {
+        let entry = PageEntry::leaf(disk_addr);
+        let entry_ref = self.map_table.get_ref(self.page);
+        entry_ref.store(entry.to_repr(), Ordering::Release);
+        self.node = entry;
+    }
+
     // pub fn node_mut<'g>(&'g mut self)
 }
 

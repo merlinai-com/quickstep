@@ -2,6 +2,20 @@
 
 # Coding History
 
+#### 2025-11-22 14:45 UTC [pending] [main]
+
+- Added eviction/liveness bitfields to `NodeMeta`, allowing mini-pages to be marked in-flight, flushed, and reclaimed. `PageWriteGuard` can now rewrite a map-table slot back to `NodeRef::Leaf`.
+- Implemented FIFO eviction in `MiniPageBuffer`: dirty entries are flushed via the new `page_op::flush_dirty_entries` helper, the circular buffer’s head advances, and `debug::record_eviction` tracks activity. `QuickStepTx::new_mini_page` now retries allocations by invoking eviction.
+- Added `tests/quickstep_eviction.rs::eviction_flushes_dirty_leaf_to_disk`, which constrains the cache, forces a split, asserts an eviction occurred, and re-reads every key afterward.
+- Documentation (README, roadmap, detailed plan) now notes the baseline eviction flow.
+
+#### 2025-11-22 14:30 UTC [pending] [main]
+
+- `NodeMeta` gained `set_disk_addr`/`set_page_id_field` helpers plus `set_identity`, allowing us to clone leaf contents during splits without losing their unique `(PageId, disk_addr)` identity.
+- `QuickStepTx::apply_leaf_split` now restores the right-hand leaf’s identity immediately after replaying entries, eliminating the “refresh later” hack and preventing future evictions from writing to the wrong disk page.
+- `DebugLeafSnapshot` exposes `disk_addr`, and the split integration tests assert every child produced by root and cascading splits lands on a unique disk page; this verifies map-table propagation + NodeRef bookkeeping end-to-end.
+- Documentation (roadmap + detailed plan) now marks the map-table propagation task complete, and README notes that the remaining Phase 1.3 work centers on merges/eviction.
+
 #### 2025-11-22 14:15 UTC [pending] [main]
 
 - Introduced `ChildPointer` + `LockedInner` so write-lock bundles retain level + node IDs; `BPNode` now has shared helpers for resetting/appending entries regardless of child type.

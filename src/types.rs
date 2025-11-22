@@ -198,12 +198,17 @@ impl NodeSize {
 ///   48b  |  3b  |   1b     |      1b     | 1b   |   1b  |      9b
 ///
 /// | NodeId | padding | free on disk
-///     48b  |    4b   |      12b
 /// Note: each record must take up at least 8 bytes, owing to the metadata, so there can only be 512/page
 ///     this means that 9b is sufficient to encode the record count
 #[repr(C)]
 // pub struct NodeMeta(AtomicU64, AtomicU64);
 pub struct NodeMeta(u64, u64);
+
+const RECORD_COUNT_MASK: u64 = 0x0000_0000_0000_01FF;
+const SPLIT_BIT: u64 = 1 << 9;
+const LIVE_BIT: u64 = 1 << 10;
+const FREELIST_BIT: u64 = 1 << 11;
+const EVICT_BIT: u64 = 1 << 12;
 
 impl NodeMeta {
     // pub unsafe fn from_repr(repr: u64) -> NodeMeta {
@@ -226,8 +231,8 @@ impl NodeMeta {
 
         let mut w0 = (disk_addr as u64) << 16;
         w0 |= (size as u64) << 13;
-        // This node is live
-        w0 |= 1 << 10;
+        w0 &= !(SPLIT_BIT | FREELIST_BIT | EVICT_BIT);
+        w0 |= LIVE_BIT;
 
         let mut w1 = guard.page.0 << 16;
         let free = 4096 - size_of::<NodeMeta>();
@@ -252,25 +257,49 @@ impl NodeMeta {
         unsafe { transmute(size_byte) }
     }
 
-    pub fn is_being_evicted(&self) -> bool {
-        todo!()
+    fn set_flag(&mut self, mask: u64, val: bool) {
+        if val {
+            self.0 |= mask;
+        } else {
+            self.0 &= !mask;
+        }
     }
 
-    // TODO: this needs to basically do a version check, so we know that the head pointer hasn't been moved past it and it hasn't been messed with
-    // since we called, is being evicted
-    pub fn mark_for_eviction(&self) -> Result<(), ()> {
-        todo!()
+    pub fn is_live(&self) -> bool {
+        (self.0 & LIVE_BIT) != 0
+    }
+
+    pub fn set_live(&mut self, live: bool) {
+        self.set_flag(LIVE_BIT, live);
+    }
+
+    pub fn is_being_evicted(&self) -> bool {
+        (self.0 & EVICT_BIT) != 0
+    }
+
+    pub fn set_being_evicted(&mut self, val: bool) {
+        self.set_flag(EVICT_BIT, val);
+    }
+
+    pub fn mark_for_eviction(&mut self) -> Result<(), ()> {
+        if self.is_being_evicted() || !self.is_live() {
+            return Err(());
+        }
+        self.set_being_evicted(true);
+        Ok(())
+    }
+
+    pub fn clear_eviction(&mut self) {
+        self.set_being_evicted(false);
     }
 
     #[inline]
     pub fn record_count(&self) -> u16 {
-        const RECORD_COUNT_MASK: u64 = 0x0000_0000_0000_01FF;
         (self.0 & RECORD_COUNT_MASK) as u16
     }
 
     #[inline]
     pub fn set_record_count(&mut self, count: u16) {
-        const RECORD_COUNT_MASK: u64 = 0x0000_0000_0000_01FF;
         self.0 &= !RECORD_COUNT_MASK;
         self.0 |= (count as u64) & RECORD_COUNT_MASK;
     }
@@ -301,13 +330,30 @@ impl NodeMeta {
     pub fn reset_header(&mut self, page_id: PageId, size: NodeSize, disk_addr: u64) {
         let mut w0 = (disk_addr as u64) << 16;
         w0 |= (size as u64) << 13;
-        w0 |= 1 << 10;
+        w0 &= !(SPLIT_BIT | FREELIST_BIT | EVICT_BIT);
+        w0 |= LIVE_BIT;
         self.0 = w0;
 
         let free = size.size_in_bytes() - size_of::<NodeMeta>();
         let mut w1 = (page_id.0) << 16;
         w1 |= (free as u64) & 0xFFFF;
         self.1 = w1;
+        self.set_record_count(0);
+    }
+
+    pub fn set_disk_addr(&mut self, disk_addr: u64) {
+        const LOWER_MASK: u64 = (1u64 << 16) - 1;
+        self.0 = (self.0 & LOWER_MASK) | (disk_addr << 16);
+    }
+
+    pub fn set_page_id_field(&mut self, page_id: PageId) {
+        const FREE_MASK: u64 = 0xFFFF;
+        self.1 = (self.1 & FREE_MASK) | (page_id.0 << 16);
+    }
+
+    pub fn set_identity(&mut self, page_id: PageId, disk_addr: u64) {
+        self.set_disk_addr(disk_addr);
+        self.set_page_id_field(page_id);
     }
 
     #[inline]

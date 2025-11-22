@@ -1,4 +1,5 @@
 use quickstep::{debug, QuickStep, QuickStepConfig};
+use std::collections::HashSet;
 use tempfile::TempDir;
 
 fn new_db() -> QuickStep {
@@ -92,6 +93,10 @@ fn root_split_occurs_and_is_readable() {
             .all(|key| key.as_slice() >= pivot.as_slice()),
         "all right-child keys must be >= pivot"
     );
+    assert_ne!(
+        left_snapshot.disk_addr, right_snapshot.disk_addr,
+        "split leaves must flush to distinct disk addresses"
+    );
 
     let mut read_tx = db.tx();
     for i in 0..inserted {
@@ -175,6 +180,10 @@ fn post_split_inserts_route_to_expected_children() {
             .iter()
             .any(|key| key.as_slice() == right_key.as_bytes()),
         "right child should contain the right-side insert"
+    );
+    assert_ne!(
+        left_snapshot.disk_addr, right_snapshot.disk_addr,
+        "post-split children must map to distinct disk addresses"
     );
 
     let mut read_tx = db.tx();
@@ -284,6 +293,15 @@ fn second_split_under_root_adds_third_child() {
     let right_snapshot = db
         .debug_leaf_snapshot(snapshot.children[2])
         .expect("right snapshot");
+    let mut disk_addrs = HashSet::new();
+    disk_addrs.insert(left_snapshot.disk_addr);
+    disk_addrs.insert(middle_snapshot.disk_addr);
+    disk_addrs.insert(right_snapshot.disk_addr);
+    assert_eq!(
+        disk_addrs.len(),
+        3,
+        "each split child should map to a unique disk page"
+    );
     assert_eq!(
         events[0].left_count,
         left_snapshot.keys.len(),

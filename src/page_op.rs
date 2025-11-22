@@ -3,7 +3,7 @@ use crate::error::QSError;
 use crate::io_engine::{DiskLeaf, IoEngine};
 use crate::lock_manager::{GuardWrapper, PageGuard, WriteGuardWrapper};
 use crate::node::InsufficientSpace;
-use crate::types::{LeafEntry, NodeMeta, NodeRef, NodeSize};
+use crate::types::{LeafEntry, NodeMeta, NodeRef};
 
 #[allow(dead_code)]
 #[derive(Debug)]
@@ -114,6 +114,32 @@ pub struct LeafSplitOutcome {
     pub right_count: usize,
 }
 
+pub fn flush_dirty_entries(node_meta: &NodeMeta, io_engine: &IoEngine) {
+    let mut disk_leaf: Option<DiskLeaf> = None;
+    let leaf_addr = node_meta.leaf();
+    let cnt = node_meta.record_count() as usize;
+    for i in 0..cnt {
+        let kv = node_meta.get_kv_meta(i);
+
+        if kv.fence() || !kv.typ().is_dirty() {
+            continue;
+        }
+
+        let entry = disk_leaf.get_or_insert_with(|| io_engine.get_page(leaf_addr));
+        let key_suffix = node_meta.get_stored_key_from_meta(kv);
+        let val = node_meta.get_val_from_meta(kv);
+
+        entry
+            .as_mut()
+            .try_put_with_suffix(key_suffix, val)
+            .expect("disk leaf should have room for cached entry");
+    }
+
+    if let Some(dirty_leaf) = disk_leaf {
+        io_engine.write_page(leaf_addr, &dirty_leaf);
+    }
+}
+
 impl<'a> PageGuard<'a> {
     pub fn get<'g>(
         &'g mut self,
@@ -214,43 +240,9 @@ impl<'a> WriteGuardWrapper<'a> {
 
         // SAFETY: we've got a write guard
         // TODO: implement safe method on buffer with page write guard
-        let node = unsafe { buffer.get_meta_ref(index) };
+        let node_meta = unsafe { buffer.get_meta_ref(index) };
 
-        let mut disk_leaf: Option<DiskLeaf> = None;
-        let leaf_addr = node.leaf();
-
-        let cnt = node.record_count() as usize;
-        // Check all entries to see if any need to be flushed to disk
-        for i in 0..cnt {
-            let kv = node.get_kv_meta(i);
-
-            if kv.fence() {
-                continue;
-            }
-
-            if kv.typ().is_dirty() {
-                if disk_leaf.is_none() {
-                    let leaf = io_engine.get_page(leaf_addr);
-                    disk_leaf = Some(leaf);
-                }
-
-                let key_suffix = node.get_stored_key_from_meta(kv);
-                let val = node.get_val_from_meta(kv);
-
-                disk_leaf
-                    .as_mut()
-                    .expect("just ensured was Some")
-                    .as_mut()
-                    .try_put_with_suffix(key_suffix, val)
-                    .expect(
-                        "We should have already split if there wouldn't be enough space on merge",
-                    );
-            }
-        }
-
-        if let Some(dirty_leaf) = disk_leaf {
-            io_engine.write_page(leaf_addr, &dirty_leaf);
-        }
+        flush_dirty_entries(node_meta, io_engine);
     }
 }
 

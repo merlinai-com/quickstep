@@ -54,6 +54,7 @@ pub struct QuickStep {
 #[derive(Debug)]
 pub struct DebugLeafSnapshot {
     pub page_id: PageId,
+    pub disk_addr: u64,
     pub keys: Vec<Vec<u8>>,
 }
 
@@ -161,6 +162,7 @@ impl QuickStep {
                 let meta = unsafe { self.cache.get_meta_ref(index) };
                 DebugLeafSnapshot {
                     page_id,
+                    disk_addr: meta.leaf(),
                     keys: collect_user_keys(meta),
                 }
             }
@@ -169,6 +171,7 @@ impl QuickStep {
                 let meta = disk_leaf.as_ref();
                 DebugLeafSnapshot {
                     page_id,
+                    disk_addr,
                     keys: collect_user_keys(meta),
                 }
             }
@@ -225,7 +228,7 @@ impl<'db> QuickStepTx<'db> {
                     Err(e) => return Err(e),
                 };
 
-                let mut right_guard = self.new_mini_page(NodeSize::LeafPage, None);
+                let mut right_guard = self.new_mini_page(NodeSize::LeafPage, None)?;
 
                 let split_outcome = Self::apply_leaf_split(
                     self.db,
@@ -324,9 +327,15 @@ impl<'db> QuickStepTx<'db> {
 
         let left_meta = unsafe { db.cache.get_meta_mut(left_index) };
         let right_meta = unsafe { db.cache.get_meta_mut(right_index) };
+        let right_page_id = right_meta.page_id();
+        let right_disk_addr = right_meta.leaf();
 
         plan.apply(left_meta, right_meta)
             .map_err(|_| QSError::SplitFailed)
+            .map(|outcome| {
+                right_meta.set_identity(right_page_id, right_disk_addr);
+                outcome
+            })
     }
     fn try_put_with_promotion(
         db: &'db QuickStep,
@@ -377,8 +386,19 @@ impl<'db> QuickStepTx<'db> {
         Ok(())
     }
 
-    fn new_mini_page(&mut self, size: NodeSize, disk_addr: Option<u64>) -> WriteGuardWrapper<'db> {
-        let new_mini_page = self.db.cache.alloc(size).expect("todo");
+    fn new_mini_page(
+        &mut self,
+        size: NodeSize,
+        disk_addr: Option<u64>,
+    ) -> Result<WriteGuardWrapper<'db>, QSError> {
+        let new_mini_page = loop {
+            if let Some(idx) = self.db.cache.alloc(size) {
+                break idx;
+            }
+            self.db
+                .cache
+                .evict(&self.db.map_table, &self.db.io_engine)?;
+        };
 
         let mut guard = unsafe { NodeMeta::init(self, new_mini_page, size, disk_addr) };
 
@@ -387,7 +407,7 @@ impl<'db> QuickStepTx<'db> {
             meta.ensure_fence_keys();
         }
 
-        guard
+        Ok(guard)
     }
 
     fn insert_into_parents_after_leaf_split(
