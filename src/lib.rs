@@ -7,12 +7,12 @@
 //! [design documentation](../design/).
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     path::{Path, PathBuf},
     ptr,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     thread,
@@ -28,7 +28,7 @@ use crate::{
     map_table::{MapTable, PageId},
     page_op::{LeafMergePlan, LeafSplitOutcome, LeafSplitPlan, TryPutResult},
     types::{NodeMeta, NodeRef, NodeSize},
-    wal::{WalManager, WalOp, WalRecord},
+    wal::{WalEntryKind, WalManager, WalOp, WalRecord, WalTxnMarker, TXN_META_PAGE_ID},
 };
 
 pub mod btree;
@@ -67,6 +67,7 @@ pub struct QuickStep {
     wal_checkpoint_requested: Arc<AtomicBool>,
     wal_checkpoint_stop: Arc<AtomicBool>,
     wal_checkpoint_thread: Option<thread::JoinHandle<()>>,
+    next_txn_id: AtomicU64,
 }
 
 const AUTO_MERGE_MIN_ENTRIES: usize = 3;
@@ -258,6 +259,7 @@ impl QuickStep {
             wal_checkpoint_requested,
             wal_checkpoint_stop,
             wal_checkpoint_thread,
+            next_txn_id: AtomicU64::new(1),
         };
 
         quickstep.ensure_root_leaf_on_disk();
@@ -272,10 +274,17 @@ impl QuickStep {
 
     /// Create a new transaction for isolated operations
     pub fn tx(&self) -> QuickStepTx<'_> {
+        let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
+        self.wal
+            .append_txn_marker(WalTxnMarker::Begin, WalEntryKind::Redo, txn_id)
+            .expect("failed to record txn begin");
         // coordination is done via the locks so it can just hold a reference to the db
         QuickStepTx {
             db: self,
             lock_manager: LockManager::new(),
+            txn_id,
+            wal_entry_kind: WalEntryKind::Redo,
+            undo_log: Vec::new(),
         }
     }
 }
@@ -377,10 +386,13 @@ impl QuickStep {
     }
 
     fn replay_wal(&self) {
-        let grouped = self.wal.records_grouped();
+        let mut grouped = self.wal.records_grouped();
         if grouped.is_empty() {
             return;
         }
+
+        let txn_meta = grouped.remove(&TXN_META_PAGE_ID).unwrap_or_default();
+        let committed = self.committed_txn_ids(&txn_meta);
 
         for (page_key, records) in grouped.into_iter() {
             let page_id = PageId(page_key);
@@ -400,8 +412,19 @@ impl QuickStep {
                     key,
                     lower_fence: record_lower,
                     upper_fence: record_upper,
+                    kind,
+                    txn_id,
                     op,
+                    ..
                 } = record;
+                if matches!(kind, WalEntryKind::Undo) {
+                    continue;
+                }
+                if let Some(committed) = committed.as_ref() {
+                    if !committed.contains(&txn_id) {
+                        continue;
+                    }
+                }
                 lower = Some(record_lower);
                 upper = Some(record_upper);
                 match op {
@@ -411,6 +434,7 @@ impl QuickStep {
                     WalOp::Put { value } => {
                         entries.insert(key, value);
                     }
+                    WalOp::TxnMarker(_) => continue,
                 }
             }
 
@@ -458,6 +482,29 @@ impl QuickStep {
         self.wal.clear().expect("failed to clear WAL after replay");
     }
 
+    fn committed_txn_ids(&self, txn_meta: &[WalRecord]) -> Option<HashSet<u64>> {
+        if txn_meta.is_empty() {
+            return None;
+        }
+        let mut latest: HashMap<u64, WalTxnMarker> = HashMap::new();
+        for record in txn_meta {
+            if let WalOp::TxnMarker(marker) = &record.op {
+                latest.insert(record.txn_id, *marker);
+            }
+        }
+        if latest.is_empty() {
+            return None;
+        }
+        let committed: HashSet<u64> = latest
+            .into_iter()
+            .filter_map(|(txn_id, marker)| match marker {
+                WalTxnMarker::Commit => Some(txn_id),
+                _ => None,
+            })
+            .collect();
+        Some(committed)
+    }
+
     pub fn debug_wal_record_count(&self) -> usize {
         self.wal.total_records()
     }
@@ -466,7 +513,23 @@ impl QuickStep {
 pub struct QuickStepTx<'db> {
     db: &'db QuickStep,
     lock_manager: LockManager<'db>,
+    txn_id: u64,
+    wal_entry_kind: WalEntryKind,
+    undo_log: Vec<UndoAction>,
     // changes for rollback
+}
+
+#[derive(Debug)]
+enum UndoAction {
+    Restore {
+        page_id: PageId,
+        key: Vec<u8>,
+        value: Vec<u8>,
+    },
+    Remove {
+        page_id: PageId,
+        key: Vec<u8>,
+    },
 }
 
 impl<'db> QuickStepTx<'db> {
@@ -493,9 +556,10 @@ impl<'db> QuickStepTx<'db> {
             .lock_manager
             .get_upgrade_or_acquire_write_lock(&self.db.map_table, res.page)?;
 
+        let undo_value = Self::existing_value(self.db, &mut page_guard, key);
         match Self::try_put_with_promotion(self.db, &mut page_guard, key, val)? {
             TryPutResult::Success => {
-                Self::append_wal_put(self.db, &mut page_guard, key, val)?;
+                self.append_wal_put(&mut page_guard, key, val, undo_value.clone())?;
                 self.maybe_global_checkpoint()?;
                 return Ok(());
             }
@@ -547,7 +611,7 @@ impl<'db> QuickStepTx<'db> {
 
                 match Self::try_put_with_promotion(self.db, target_guard, key, val)? {
                     TryPutResult::Success => {
-                        Self::append_wal_put(self.db, target_guard, key, val)?;
+                        self.append_wal_put(target_guard, key, val, undo_value.clone())?;
                         self.maybe_global_checkpoint()?;
                         return Ok(());
                     }
@@ -563,9 +627,21 @@ impl<'db> QuickStepTx<'db> {
         }
     }
 
-    pub fn abort(self) {}
+    pub fn abort(mut self) {
+        self.apply_undo_actions()
+            .expect("failed to roll back transaction");
+        self.db
+            .wal
+            .append_txn_marker(WalTxnMarker::Abort, self.wal_entry_kind, self.txn_id)
+            .expect("failed to record txn abort");
+    }
 
-    pub fn commit(self) {}
+    pub fn commit(self) {
+        self.db
+            .wal
+            .append_txn_marker(WalTxnMarker::Commit, self.wal_entry_kind, self.txn_id)
+            .expect("failed to record txn commit");
+    }
 }
 
 fn resolve_data_path(path: &Path) -> PathBuf {
@@ -623,17 +699,111 @@ impl<'db> QuickStepTx<'db> {
     }
 
     fn append_wal_put(
-        db: &'db QuickStep,
+        &mut self,
         guard: &mut WriteGuardWrapper<'db>,
         key: &[u8],
         val: &[u8],
+        undo_value: Option<Vec<u8>>,
     ) -> Result<(), QSError> {
         let page_id = guard.page_id();
-        let (_disk_addr, lower_fence, upper_fence) = Self::leaf_snapshot(db, guard);
-        db.wal
-            .append_put(page_id, key, val, &lower_fence, &upper_fence)
+        let (_disk_addr, lower_fence, upper_fence) = Self::leaf_snapshot(self.db, guard);
+        self.db
+            .wal
+            .append_put(
+                page_id,
+                key,
+                val,
+                &lower_fence,
+                &upper_fence,
+                self.wal_entry_kind,
+                self.txn_id,
+            )
             .expect("failed to record put in WAL");
-        Self::maybe_checkpoint_leaf(db, guard, page_id)?;
+        if let Some(prev) = undo_value.as_ref() {
+            self.db
+                .wal
+                .append_put(
+                    page_id,
+                    key,
+                    prev,
+                    &lower_fence,
+                    &upper_fence,
+                    WalEntryKind::Undo,
+                    self.txn_id,
+                )
+                .expect("failed to record undo put in WAL");
+        } else {
+            self.db
+                .wal
+                .append_tombstone(
+                    page_id,
+                    key,
+                    &lower_fence,
+                    &upper_fence,
+                    WalEntryKind::Undo,
+                    self.txn_id,
+                )
+                .expect("failed to record undo tombstone in WAL");
+        }
+        self.log_put_undo(page_id, key, undo_value);
+        Self::maybe_checkpoint_leaf(self.db, guard, page_id)?;
+        Ok(())
+    }
+
+    fn log_put_undo(&mut self, page_id: PageId, key: &[u8], undo_value: Option<Vec<u8>>) {
+        match undo_value {
+            Some(value) => self.undo_log.push(UndoAction::Restore {
+                page_id,
+                key: key.to_vec(),
+                value,
+            }),
+            None => self.undo_log.push(UndoAction::Remove {
+                page_id,
+                key: key.to_vec(),
+            }),
+        }
+    }
+
+    fn log_delete_undo(&mut self, page_id: PageId, key: &[u8], value: Option<Vec<u8>>) {
+        if let Some(value) = value {
+            self.undo_log.push(UndoAction::Restore {
+                page_id,
+                key: key.to_vec(),
+                value,
+            });
+        }
+    }
+
+    fn apply_undo_actions(&mut self) -> Result<(), QSError> {
+        while let Some(action) = self.undo_log.pop() {
+            self.apply_undo_action(action)?;
+        }
+        Ok(())
+    }
+
+    fn apply_undo_action(&mut self, action: UndoAction) -> Result<(), QSError> {
+        let page_id = match &action {
+            UndoAction::Restore { page_id, .. } | UndoAction::Remove { page_id, .. } => *page_id,
+        };
+        let mut guard = self
+            .lock_manager
+            .get_upgrade_or_acquire_write_lock(&self.db.map_table, page_id)?;
+        Self::ensure_mini_page(self.db, &mut guard)?;
+        let index = match guard.get_write_guard().node() {
+            NodeRef::MiniPage(idx) => idx,
+            NodeRef::Leaf(_) => unreachable!("mini page expected after promotion"),
+        };
+        let meta = unsafe { self.db.cache.get_meta_mut(index) };
+        match action {
+            UndoAction::Restore { key, value, .. } => {
+                meta.remove_key_physical(&key);
+                meta.try_put(&key, &value)
+                    .map_err(|_| QSError::SplitFailed)?;
+            }
+            UndoAction::Remove { key, .. } => {
+                meta.remove_key_physical(&key);
+            }
+        }
         Ok(())
     }
 
@@ -652,6 +822,23 @@ impl<'db> QuickStepTx<'db> {
                 let meta = leaf.as_ref();
                 let (lower, upper) = collect_fence_keys(meta);
                 (addr, lower, upper)
+            }
+        }
+    }
+
+    fn existing_value(
+        db: &'db QuickStep,
+        guard: &mut WriteGuardWrapper<'db>,
+        key: &[u8],
+    ) -> Option<Vec<u8>> {
+        match guard.get_write_guard().node() {
+            NodeRef::MiniPage(idx) => {
+                let meta = unsafe { db.cache.get_meta_ref(idx) };
+                meta.get(key).map(|value| value.to_vec())
+            }
+            NodeRef::Leaf(addr) => {
+                let leaf = db.io_engine.get_page(addr);
+                leaf.as_ref().get(key).map(|value| value.to_vec())
             }
         }
     }
@@ -1210,9 +1397,14 @@ impl<'db> QuickStepTx<'db> {
             NodeRef::MiniPage(idx) => idx,
             NodeRef::Leaf(_) => unreachable!("mini page expected after promotion"),
         };
+        let deleted_value;
         let user_entries;
         {
             let meta = unsafe { self.db.cache.get_meta_mut(index) };
+            deleted_value = meta.get(key).map(|value| value.to_vec());
+            if deleted_value.is_none() {
+                return Ok(false);
+            }
             let removed = meta.mark_tombstone(key);
             if !removed {
                 return Ok(false);
@@ -1222,8 +1414,30 @@ impl<'db> QuickStepTx<'db> {
         let (_disk_addr, lower_fence, upper_fence) = Self::leaf_snapshot(self.db, &mut page_guard);
         self.db
             .wal
-            .append_tombstone(page_id, key, &lower_fence, &upper_fence)
+            .append_tombstone(
+                page_id,
+                key,
+                &lower_fence,
+                &upper_fence,
+                self.wal_entry_kind,
+                self.txn_id,
+            )
             .expect("failed to record delete in WAL");
+        if let Some(prev) = deleted_value.as_ref() {
+            self.db
+                .wal
+                .append_put(
+                    page_id,
+                    key,
+                    prev,
+                    &lower_fence,
+                    &upper_fence,
+                    WalEntryKind::Undo,
+                    self.txn_id,
+                )
+                .expect("failed to record undo delete in WAL");
+        }
+        self.log_delete_undo(page_id, key, deleted_value);
         Self::maybe_checkpoint_leaf(self.db, &mut page_guard, page_id)?;
         self.maybe_global_checkpoint()?;
         if user_entries <= AUTO_MERGE_MIN_ENTRIES {

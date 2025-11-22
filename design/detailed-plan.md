@@ -198,3 +198,10 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
 2. Requires eviction to surface dirty-page lists so checkpoints can batch flushes efficiently.
 3. Decide whether undo lives in the main WAL or a side log (TBD in Phase 2).
 
+### 2.3.4 – Current progress (22 Nov 2025)
+1. ✅ `WalRecord` now encodes `WalEntryKind` (redo/undo placeholder) and a 64-bit `txn_id` so future undo logging can reuse the existing serializer/deserializer.
+2. ✅ `QuickStepTx` allocates monotonically increasing transaction IDs (`QuickStep::next_txn_id`) and stamps every WAL append with both `txn_id` and entry kind.
+3. ✅ `QuickStepTx::tx()/commit()/abort()` now emit `WalTxnMarker::{Begin,Commit,Abort}` records into a reserved WAL page (`PageId = u64::MAX`), so crash recovery can observe txn boundaries before we wire the undo pass.
+4. ✅ Redo/undo payloads now share the same `WalOp` encoding: every logical mutation appends a redo entry plus its inverse (undo) so rollback can reinstall deleted values or remove freshly inserted keys without scanning the data file.
+5. ☐ Add a manifest/checkpoint LSN per Section 2.3.2 to bound WAL growth and enable redo pruning without losing undo context.
+

@@ -10,6 +10,10 @@ use crate::map_table::PageId;
 
 const RECORD_TYPE_PUT: u8 = 0;
 const RECORD_TYPE_TOMBSTONE: u8 = 1;
+const RECORD_TYPE_TXN_BEGIN: u8 = 2;
+const RECORD_TYPE_TXN_COMMIT: u8 = 3;
+const RECORD_TYPE_TXN_ABORT: u8 = 4;
+pub const TXN_META_PAGE_ID: u64 = u64::MAX;
 const GROUP_MARKER: u8 = 0xAA;
 const GROUP_HEADER_LEN: usize = 1 + 8 + 4;
 
@@ -19,13 +23,64 @@ pub struct WalRecord {
     pub key: Vec<u8>,
     pub lower_fence: Vec<u8>,
     pub upper_fence: Vec<u8>,
+    pub kind: WalEntryKind,
+    pub txn_id: u64,
     pub op: WalOp,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum WalEntryKind {
+    Redo,
+    Undo,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum WalTxnMarker {
+    Begin,
+    Commit,
+    Abort,
 }
 
 #[derive(Clone, Debug)]
 pub enum WalOp {
     Put { value: Vec<u8> },
     Tombstone,
+    TxnMarker(WalTxnMarker),
+}
+
+impl WalEntryKind {
+    fn as_byte(self) -> u8 {
+        match self {
+            WalEntryKind::Redo => 0,
+            WalEntryKind::Undo => 1,
+        }
+    }
+
+    fn from_byte(byte: u8) -> Self {
+        match byte {
+            1 => WalEntryKind::Undo,
+            _ => WalEntryKind::Redo,
+        }
+    }
+}
+
+impl WalTxnMarker {
+    fn to_record_type(self) -> u8 {
+        match self {
+            WalTxnMarker::Begin => RECORD_TYPE_TXN_BEGIN,
+            WalTxnMarker::Commit => RECORD_TYPE_TXN_COMMIT,
+            WalTxnMarker::Abort => RECORD_TYPE_TXN_ABORT,
+        }
+    }
+
+    fn from_record_type(tag: u8) -> Option<Self> {
+        match tag {
+            RECORD_TYPE_TXN_BEGIN => Some(WalTxnMarker::Begin),
+            RECORD_TYPE_TXN_COMMIT => Some(WalTxnMarker::Commit),
+            RECORD_TYPE_TXN_ABORT => Some(WalTxnMarker::Abort),
+            _ => None,
+        }
+    }
 }
 
 struct LeafWalStats {
@@ -116,12 +171,16 @@ impl WalManager {
         key: &[u8],
         lower_fence: &[u8],
         upper_fence: &[u8],
+        kind: WalEntryKind,
+        txn_id: u64,
     ) -> io::Result<()> {
         self.append_record(WalRecord {
             page_id: page_id.as_u64(),
             key: key.to_vec(),
             lower_fence: lower_fence.to_vec(),
             upper_fence: upper_fence.to_vec(),
+            kind,
+            txn_id,
             op: WalOp::Tombstone,
         })
     }
@@ -133,15 +192,36 @@ impl WalManager {
         value: &[u8],
         lower_fence: &[u8],
         upper_fence: &[u8],
+        kind: WalEntryKind,
+        txn_id: u64,
     ) -> io::Result<()> {
         self.append_record(WalRecord {
             page_id: page_id.as_u64(),
             key: key.to_vec(),
             lower_fence: lower_fence.to_vec(),
             upper_fence: upper_fence.to_vec(),
+            kind,
+            txn_id,
             op: WalOp::Put {
                 value: value.to_vec(),
             },
+        })
+    }
+
+    pub fn append_txn_marker(
+        &self,
+        marker: WalTxnMarker,
+        kind: WalEntryKind,
+        txn_id: u64,
+    ) -> io::Result<()> {
+        self.append_record(WalRecord {
+            page_id: TXN_META_PAGE_ID,
+            key: Vec::new(),
+            lower_fence: Vec::new(),
+            upper_fence: Vec::new(),
+            kind,
+            txn_id,
+            op: WalOp::TxnMarker(marker),
         })
     }
 
@@ -244,6 +324,7 @@ impl WalManager {
         state
             .leaf_counts
             .iter()
+            .filter(|(page, _)| **page != TXN_META_PAGE_ID)
             .max_by_key(|(_, stats)| stats.bytes)
             .map(|(page, _)| PageId(*page))
     }
@@ -299,6 +380,9 @@ fn write_record_payload(file: &mut File, record: &WalRecord) -> io::Result<usize
     match &record.op {
         WalOp::Put { value } => {
             file.write_all(&[RECORD_TYPE_PUT])?;
+            file.write_all(&[record.kind.as_byte()])?;
+            file.write_all(&record.txn_id.to_le_bytes())?;
+            let header_bytes = 1 + 8;
             let key_len = record.key.len() as u32;
             let val_len = value.len() as u32;
             let lower_len = record.lower_fence.len() as u32;
@@ -311,7 +395,9 @@ fn write_record_payload(file: &mut File, record: &WalRecord) -> io::Result<usize
             file.write_all(value)?;
             file.write_all(&record.lower_fence)?;
             file.write_all(&record.upper_fence)?;
-            Ok(1 + 4
+            Ok(header_bytes
+                + 1
+                + 4
                 + 4
                 + 4
                 + 4
@@ -322,6 +408,9 @@ fn write_record_payload(file: &mut File, record: &WalRecord) -> io::Result<usize
         }
         WalOp::Tombstone => {
             file.write_all(&[RECORD_TYPE_TOMBSTONE])?;
+            file.write_all(&[record.kind.as_byte()])?;
+            file.write_all(&record.txn_id.to_le_bytes())?;
+            let header_bytes = 1 + 8;
             let key_len = record.key.len() as u32;
             let lower_len = record.lower_fence.len() as u32;
             let upper_len = record.upper_fence.len() as u32;
@@ -331,12 +420,21 @@ fn write_record_payload(file: &mut File, record: &WalRecord) -> io::Result<usize
             file.write_all(&record.key)?;
             file.write_all(&record.lower_fence)?;
             file.write_all(&record.upper_fence)?;
-            Ok(1 + 4
+            Ok(header_bytes
+                + 1
+                + 4
                 + 4
                 + 4
                 + record.key.len()
                 + record.lower_fence.len()
                 + record.upper_fence.len())
+        }
+        WalOp::TxnMarker(marker) => {
+            file.write_all(&[marker.to_record_type()])?;
+            file.write_all(&[record.kind.as_byte()])?;
+            file.write_all(&record.txn_id.to_le_bytes())?;
+            let header_bytes = 1 + 8;
+            Ok(header_bytes + 1)
         }
     }
 }
@@ -368,6 +466,13 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, HashMap<u64, usi
             }
             let record_type = bytes[idx];
             idx += 1;
+            if bytes.len() - idx < 1 + 8 {
+                break 'outer;
+            }
+            let entry_kind = WalEntryKind::from_byte(bytes[idx]);
+            idx += 1;
+            let txn_id = u64::from_le_bytes(bytes[idx..idx + 8].try_into().unwrap());
+            idx += 8;
             match record_type {
                 RECORD_TYPE_TOMBSTONE => {
                     if bytes.len() - idx < 12 {
@@ -396,6 +501,8 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, HashMap<u64, usi
                         key,
                         lower_fence: lower,
                         upper_fence: upper,
+                        kind: entry_kind,
+                        txn_id,
                         op: WalOp::Tombstone,
                     };
                     payload_bytes = payload_bytes.saturating_add(record_size(&record));
@@ -433,7 +540,24 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, HashMap<u64, usi
                         key,
                         lower_fence: lower,
                         upper_fence: upper,
+                        kind: entry_kind,
+                        txn_id,
                         op: WalOp::Put { value },
+                    };
+                    payload_bytes = payload_bytes.saturating_add(record_size(&record));
+                    records.push(record);
+                }
+                RECORD_TYPE_TXN_BEGIN | RECORD_TYPE_TXN_COMMIT | RECORD_TYPE_TXN_ABORT => {
+                    let marker =
+                        WalTxnMarker::from_record_type(record_type).expect("invalid txn marker");
+                    let record = WalRecord {
+                        page_id,
+                        key: Vec::new(),
+                        lower_fence: Vec::new(),
+                        upper_fence: Vec::new(),
+                        kind: entry_kind,
+                        txn_id,
+                        op: WalOp::TxnMarker(marker),
                     };
                     payload_bytes = payload_bytes.saturating_add(record_size(&record));
                     records.push(record);
@@ -460,7 +584,9 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, HashMap<u64, usi
 fn record_size(record: &WalRecord) -> usize {
     match &record.op {
         WalOp::Put { value } => {
-            1 + 4
+            1 + 8
+                + 1
+                + 4
                 + 4
                 + 4
                 + 4
@@ -470,7 +596,15 @@ fn record_size(record: &WalRecord) -> usize {
                 + record.upper_fence.len()
         }
         WalOp::Tombstone => {
-            1 + 4 + 4 + 4 + record.key.len() + record.lower_fence.len() + record.upper_fence.len()
+            1 + 8
+                + 1
+                + 4
+                + 4
+                + 4
+                + record.key.len()
+                + record.lower_fence.len()
+                + record.upper_fence.len()
         }
+        WalOp::TxnMarker(_) => 1 + 8 + 1,
     }
 }

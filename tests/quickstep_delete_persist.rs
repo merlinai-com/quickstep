@@ -1,4 +1,9 @@
-use quickstep::{debug, map_table::PageId, wal::WalManager, QuickStep, QuickStepConfig};
+use quickstep::{
+    debug,
+    map_table::PageId,
+    wal::{WalEntryKind, WalManager},
+    QuickStep, QuickStepConfig,
+};
 use tempfile::TempDir;
 
 fn wal_record_count(db: &QuickStep, page_id: Option<PageId>) -> usize {
@@ -11,10 +16,25 @@ fn wal_records_include_fence_bounds() {
     let wal_path = temp.path().join("quickstep.wal");
     {
         let wal = WalManager::open(&wal_path).expect("open wal");
-        wal.append_put(PageId::from_u64(7), b"key-0001", b"value", &[0x00], &[0x7F])
-            .expect("append put");
-        wal.append_tombstone(PageId::from_u64(7), b"key-0002", &[0x10], &[0x80])
-            .expect("append tombstone");
+        wal.append_put(
+            PageId::from_u64(7),
+            b"key-0001",
+            b"value",
+            &[0x00],
+            &[0x7F],
+            WalEntryKind::Redo,
+            1,
+        )
+        .expect("append put");
+        wal.append_tombstone(
+            PageId::from_u64(7),
+            b"key-0002",
+            &[0x10],
+            &[0x80],
+            WalEntryKind::Redo,
+            1,
+        )
+        .expect("append tombstone");
     }
 
     let wal = WalManager::open(&wal_path).expect("reopen wal");
@@ -220,8 +240,8 @@ fn wal_auto_checkpoint_trims_entries() {
         tx.commit();
     }
     assert!(
-        wal_record_count(&db, Some(PageId::from_u64(0))) < 8,
-        "auto checkpoint should prune per-leaf WAL entries"
+        wal_record_count(&db, Some(PageId::from_u64(0))) < 16,
+        "auto checkpoint should prune per-leaf WAL entries even with redo/undo logging"
     );
 }
 
@@ -239,8 +259,8 @@ fn wal_byte_threshold_triggers_checkpoint() {
         }
         tx.commit();
         assert!(
-            wal_record_count(&db, Some(PageId::from_u64(0))) < 4,
-            "byte-based threshold should trigger global checkpoint"
+            wal_record_count(&db, Some(PageId::from_u64(0))) < 8,
+            "byte-based threshold should trigger global checkpoint even with redo/undo logging"
         );
     }
 }
@@ -265,8 +285,8 @@ fn wal_respects_custom_thresholds() {
         tx.commit();
     }
     assert!(
-        wal_record_count(&db, Some(PageId::from_u64(0))) >= 48,
-        "custom thresholds should delay automatic pruning"
+        wal_record_count(&db, Some(PageId::from_u64(0))) >= 96,
+        "custom thresholds should delay automatic pruning, counting redo+undo entries"
     );
 }
 
@@ -278,12 +298,35 @@ fn wal_checkpoint_drops_only_target_page() {
 
     let lower = &[0x00];
     let upper = &[0xFF];
-    wal.append_put(PageId::from_u64(5), b"alpha", b"v1", lower, upper)
-        .expect("append put");
-    wal.append_tombstone(PageId::from_u64(5), b"beta", lower, upper)
-        .expect("append tombstone");
-    wal.append_put(PageId::from_u64(9), b"gamma", b"v2", lower, upper)
-        .expect("append put");
+    wal.append_put(
+        PageId::from_u64(5),
+        b"alpha",
+        b"v1",
+        lower,
+        upper,
+        WalEntryKind::Redo,
+        1,
+    )
+    .expect("append put");
+    wal.append_tombstone(
+        PageId::from_u64(5),
+        b"beta",
+        lower,
+        upper,
+        WalEntryKind::Redo,
+        1,
+    )
+    .expect("append tombstone");
+    wal.append_put(
+        PageId::from_u64(9),
+        b"gamma",
+        b"v2",
+        lower,
+        upper,
+        WalEntryKind::Redo,
+        2,
+    )
+    .expect("append put");
 
     let grouped = wal.records_grouped();
     assert_eq!(
