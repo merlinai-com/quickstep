@@ -215,8 +215,8 @@ impl BPTree {
             page: leaf_cand,
             overflow_point,
             underflow_point,
-            lower_fence_key: todo!(),
-            upper_fence_key: todo!(),
+            lower_fence_key: None,
+            upper_fence_key: None,
         });
     }
 
@@ -305,6 +305,29 @@ impl BPTree {
             root_lock,
             chain: acc,
         })
+    }
+
+    pub fn debug_root_leaf_parent(&self) -> Option<DebugLeafParent> {
+        let root_guard = self.read_root().ok()?;
+        let info = root_guard.get_root();
+        let snapshot = match info {
+            BPRootInfo::Inner { level, node } if level.get() == 1 => {
+                let inner_guard = self.read_inner(node).ok()?;
+                let node_ref = inner_guard.as_ref();
+                let mut pivots = Vec::with_capacity(node_ref.count as usize);
+                let mut children = Vec::with_capacity(node_ref.count as usize + 1);
+                children.push(PageId(node_ref.lowest));
+                for idx in 0..node_ref.count {
+                    pivots.push(node_ref.get_key(idx).to_vec());
+                    children.push(node_ref.get_leaf_child(idx));
+                }
+                inner_guard.unlock_or_restart().ok()?;
+                Some(DebugLeafParent { pivots, children })
+            }
+            _ => None,
+        };
+        root_guard.unlock_or_restart().ok()?;
+        snapshot
     }
 }
 
@@ -430,6 +453,12 @@ pub enum BPRootInfo {
         level: NonZeroU16,
         node: BPNodeId,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct DebugLeafParent {
+    pub pivots: Vec<Vec<u8>>,
+    pub children: Vec<PageId>,
 }
 
 #[derive(Clone)]
@@ -724,22 +753,23 @@ impl BPNode {
         }
     }
 
-    // find the index of the largest key smaller than the target, and that key
+    // find the index of the largest key smaller than or equal to the target
     #[inline]
     fn binary_search(&self, key: &[u8]) -> u32 {
         let mut low = 0;
         let mut high = self.count;
 
         while low < high {
-            let mid = low.midpoint(high);
+            let mid = low + (high - low) / 2;
             let mid_key = self.get_key(mid);
             if mid_key <= key {
-                low = mid;
+                low = mid + 1;
             } else {
-                high = mid - 1;
+                high = mid;
             }
         }
-        return low;
+
+        low.saturating_sub(1)
     }
 
     fn get_meta(&self, idx: u32) -> BPKVMeta {

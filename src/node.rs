@@ -162,7 +162,7 @@ impl NodeMeta {
 
                 let size = key_suffix.len() + val.len();
                 let min_offset = self.find_min_offset();
-                let new_offset = min_offset - size;
+                let new_offset = min_offset.checked_sub(size).ok_or(InsufficientSpace)?;
 
                 // add 1 for NodeMeta and one for new KVMeta
                 let meta_end = (self.record_count() as usize + 2) * size_of::<KVMeta>();
