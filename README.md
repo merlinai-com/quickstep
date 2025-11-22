@@ -82,6 +82,7 @@ cargo doc --open
 - Minimal WAL support (puts + deletes) replays cached updates during startup, per-leaf checkpoints prune the log, and a global WAL pressure monitor flushes the busiest leaves when the log grows too large
 - Configurable WAL thresholds via `QuickStepConfig::with_wal_thresholds(...)`, the `QUICKSTEP_WAL_LEAF_THRESHOLD`, `QUICKSTEP_WAL_GLOBAL_RECORD_THRESHOLD`, and `QUICKSTEP_WAL_GLOBAL_BYTE_THRESHOLD` env vars, or CLI flags `--quickstep-wal-{leaf,global-record,global-byte}-threshold`, plus debug WAL stats (`QuickStep::debug_wal_stats`) and a lightweight background WAL monitor for observability/auto-checkpointing
 - Fence guards derived from parent pivots via `QuickStep::debug_leaf_fences`, with integration tests (`tests/quickstep_fence_keys.rs`) that verify page 0 uses the sentinel `[0x00]`/`[0xFF]` bounds while split children, merge survivors, eviction-flushed leaves, and delete-triggered auto-merge survivors maintain monotonic lower/upper fences that cover their user keys; WAL entries now embed those fence bounds so crash replay reinstalls the same ranges before applying writes
+- WAL records are grouped per logical `PageId`, checkpoints operate on `checkpoint_page(PageId)`, and startup replay hydrates both disk and cached leaves before flushing; the merge-crash regression runs entirely through the public API.
 - WAL records are grouped per logical `PageId`, and crash replay reinstalls each leaf’s `[lower, upper]` bounds plus the sorted key/value set before writing back to disk; the merge-crash regression now passes via public operations only.
 
 ### ⚠️ Partially Implemented
@@ -93,7 +94,7 @@ cargo doc --open
 - Merge logic (leaf-level merge plan, parent rewiring, root demotion, and merge instrumentation are implemented; delete-triggered thresholds and non-root cascading merges are still outstanding)
 - Buffer eviction (structure present, merge-to-disk incomplete)
 - I/O engine (read/write path works; WAL still lacks redo/undo for complex transactions and finer-grained checkpoint orchestration)
-- WAL crash recovery now relies on logical `PageId`s instead of physical disk addresses; remaining Phase 1.4 work focuses on compact page-group framing in the WAL file and broader eviction/replay regression coverage (see `design/detailed-plan.md`).
+- WAL crash recovery now relies on logical `PageId`s with length-prefixed page groups. Remaining work focuses on broader eviction/replay regression coverage and documenting the new on-disk framing plus redo/undo requirements (see `design/detailed-plan.md` §1.4/§2.3).
 
 ### ❌ Not Yet Implemented
 

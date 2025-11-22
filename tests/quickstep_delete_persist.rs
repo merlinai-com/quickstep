@@ -269,3 +269,58 @@ fn wal_respects_custom_thresholds() {
         "custom thresholds should delay automatic pruning"
     );
 }
+
+#[test]
+fn wal_checkpoint_drops_only_target_page() {
+    let temp = TempDir::new().expect("tempdir");
+    let wal_path = temp.path().join("checkpoint.wal");
+    let wal = WalManager::open(&wal_path).expect("open wal");
+
+    let lower = &[0x00];
+    let upper = &[0xFF];
+    wal.append_put(PageId::from_u64(5), b"alpha", b"v1", lower, upper)
+        .expect("append put");
+    wal.append_tombstone(PageId::from_u64(5), b"beta", lower, upper)
+        .expect("append tombstone");
+    wal.append_put(PageId::from_u64(9), b"gamma", b"v2", lower, upper)
+        .expect("append put");
+
+    let grouped = wal.records_grouped();
+    assert_eq!(
+        grouped.get(&5).map(|records| records.len()),
+        Some(2),
+        "page 5 should have two records before checkpoint"
+    );
+    assert_eq!(
+        grouped.get(&9).map(|records| records.len()),
+        Some(1),
+        "page 9 should have one record before checkpoint"
+    );
+
+    wal.checkpoint_page(PageId::from_u64(5))
+        .expect("checkpoint page 5");
+
+    let grouped = wal.records_grouped();
+    assert!(
+        grouped.get(&5).is_none(),
+        "page 5 entries should be removed after checkpoint"
+    );
+    assert_eq!(
+        grouped.get(&9).map(|records| records.len()),
+        Some(1),
+        "page 9 entries should remain after checkpoint"
+    );
+
+    drop(wal);
+    let reopened = WalManager::open(&wal_path).expect("reopen wal");
+    let grouped = reopened.records_grouped();
+    assert!(
+        grouped.get(&5).is_none(),
+        "page 5 entries should stay removed after reopen"
+    );
+    assert_eq!(
+        grouped.get(&9).map(|records| records.len()),
+        Some(1),
+        "page 9 entries should persist after reopen"
+    );
+}

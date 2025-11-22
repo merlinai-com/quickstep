@@ -21,7 +21,7 @@
 | 1.1 | Implement `QuickStep::new()` | ✅ | Wire up BPTree, buffer, map table, IO |
 | 1.2 | Finish `put()` happy path | ✅ | Handle mini-page allocation/write, no splitting |
 | 1.3 | Implement split/merge logic | WIP | Root-level leaf splits + cascading parent merges implemented with debug instrumentation; new siblings publish map-table identities immediately; baseline cache eviction now flushes dirty leaves on demand; leaf merges + delete-triggered tombstones work end-to-end, while range deletes and second-chance eviction remain pending |
-| 1.4 | Harden WAL replay with PageId-based logging | Planned | Mirrors Section 1.4 in `design/detailed-plan.md`: log fences + mutations per logical `PageId`, group WAL entries per leaf, reinstall fences before replaying records, and unblock the merge-crash regression without relying on stale disk addresses |
+| 1.4 | Harden WAL replay with PageId-based logging | ✅ | WAL records are length-prefixed page groups keyed by `PageId`; replay reinstalls fences + entries for each leaf, checkpoints operate on logical pages, and the merge-crash regression passes via public APIs. Remaining work: eviction-focused replay tests + redo/undo planning (see detailed plan §1.4). |
 | 1.5 | Complete `get()` fence key handling |  | Lower/upper fence construction |
 | 1.6 | Implement `abort`/`commit` on `QuickStepTx` |  | Track changes for rollback |
 

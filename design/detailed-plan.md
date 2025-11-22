@@ -151,24 +151,50 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
 
 ### 1.4.1 – Format & plumbing updates
 1. ✅ `WalRecord` now carries only the logical `PageId`, fence blobs, and the key/value payload—no physical `disk_addr`. `QuickStepTx::append_wal_put/delete` capture `[lower, upper]` fences plus the key/value and pass them to the new interface.
-2. ✅ `WalManager` serializes/deserializes the slimmer record header and exposes `records_grouped()` so replay can iterate batches per page without ad-hoc Vec regrouping.
+2. ✅ `WalManager` serializes/deserializes length-prefixed page groups (`GROUP_MARKER`, `PageId`, record count) and exposes `records_grouped()` so replay can iterate batches per page without ad-hoc Vec regrouping.
 3. ✅ Per-leaf accounting moved to `PageId` as well: checkpoint thresholds, global-prune candidates, `debug_wal_stats`, and `wal_record_count` in the tests all operate on logical pages now.
-4. ☐ Follow-up: emit explicit length-prefixed “page groups” in the WAL file so readers can skip whole batches without reallocating.
+4. ✅ File rewrite/checkpoint logic now rebuilds page groups (instead of cloning individual records) so the WAL never accumulates stale physical addresses. Future enhancement: add compression/delta encoding for large batches (tracked separately).
 
 ### 1.4.2 – Replay redesign
 1. ✅ Startup replay now consumes `records_grouped()`, resolves the current `PageId` binding via the map table, and hydrates both the on-disk leaf plus any cached `NodeMeta` with the recorded fences before reapplying user entries.
 2. ✅ Entries within a batch are replayed through the existing `NodeMeta::replay_entries` iterator (which sorts via `BTreeMap`), guaranteeing page-level space accounting. Once a page finishes, we write the page back to disk and refresh the cached copy (if resident).
 3. ✅ Fence metadata is reinstalled first, fixing the merge-crash case where stale sentinel bounds caused prefix compression failures.
 4. ✅ `checkpoint_leaf` → `checkpoint_page`, `should_checkpoint_page`, and `leaf_stats(PageId)` ensure WAL pruning keys off logical IDs. Global checkpoints also use `PageId`, and eviction checkpoints call the new API after flushing dirty leaves.
-5. ☐ Future: once serializer emits explicit page-group frames, we can truncate the WAL incrementally without cloning the full record Vec.
+5. ✅ Page-group framing allows `rewrite_records` to stream sequential batches per page and rebuild the WAL deterministically after checkpoints.
 
 ### 1.4.3 – Testing & docs
-1. ✅ `tests/quickstep_delete_persist.rs::wal_replay_survives_merge_crash` now uses only public operations (split via inserts, deletes that trigger auto-merge) and passes under the new replay logic. It previously panicked with stale `disk_addr` writes; now it exercises the PageId path end-to-end.
+1. ✅ `tests/quickstep_delete_persist.rs::wal_replay_survives_merge_crash` now uses only public operations (split via inserts, deletes that trigger auto-merge) and passes under the new replay logic. It previously panicked with stale `disk_addr` writes; now it exercises the PageId + page-group path end-to-end.
 2. ✅ `wal_records_include_fence_bounds` updated to cover the new record format and continues to assert fence blob round-trips.
-3. ☐ Expand `tests/quickstep_fence_keys.rs`/new eviction tests to validate fence monotonicity immediately after WAL replay when some leaves stay cached. (Tracked in TODO.)
+3. ☐ TODO: add WAL file regression that appends multiple pages, runs `checkpoint_page`, and asserts only the surviving page’s group remains; extend fence/eviction tests to cover replay while one sibling stays cached.
 4. ✅ README + roadmap mention the PageId-based WAL plan; this document records the completed sub-tasks above.
 
 ### 1.4.4 – Rollout
 1. Land the format + replay changes behind a feature branch, run the full `quickstep_delete_persist` suite, and explicitly record the before/after behaviour in `CODING_HISTORY.md`.
 2. Once stable, trim the old fence-sentinel code and update the operator docs with the new guarantees (fence metadata logged per leaf, WAL grouped per page). Finish by marking 1.4 as “Complete” in this plan.
+
+---
+
+## 2.3 – WAL redo/undo + durable checkpoints (Outline)
+
+**Goal:** build on the PageId-based WAL to support crash-safe commits (redo) and in-flight rollback (undo) while keeping checkpoints deterministic.
+
+### 2.3.1 – Requirements
+1. Redo logging for puts/deletes that haven’t yet reached disk checkpoints.
+2. Undo records for uncommitted transactions once we add `QuickStepTx::abort/commit`.
+3. Crash-safe checkpoints that flush both dirty leaves and WAL segments atomically.
+
+### 2.3.2 – Proposed approach
+1. Extend `WalRecord` with an op-type enum (`RedoPut`, `RedoDelete`, `UndoPut`, `UndoDelete`) plus transaction IDs once txn semantics exist. Redo entries stay grouped per `PageId`; undo entries can be grouped per txn.
+2. Introduce a WAL manifest or “checkpoint LSN” so we can truncate only the fully applied segments while keeping redo/undo ordering intact.
+3. Checkpoint protocol:
+   - Acquire write locks for dirty pages, flush them to disk, emit a `CheckpointComplete {page_ids}` record, then fsync both data + WAL.
+   - After success, drop WAL groups up to the checkpoint LSN.
+4. Recovery steps:
+   - Replay redo groups per page (as we do now).
+   - Scan undo sections for any txn without a corresponding commit marker and roll those back before opening for writes.
+
+### 2.3.3 – Dependencies / open questions
+1. Needs transactional metadata (`QuickStepTx` commit markers, txn IDs).
+2. Requires eviction to surface dirty-page lists so checkpoints can batch flushes efficiently.
+3. Decide whether undo lives in the main WAL or a side log (TBD in Phase 2).
 

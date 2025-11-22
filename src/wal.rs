@@ -10,6 +10,8 @@ use crate::map_table::PageId;
 
 const RECORD_TYPE_PUT: u8 = 0;
 const RECORD_TYPE_TOMBSTONE: u8 = 1;
+const GROUP_MARKER: u8 = 0xAA;
+const GROUP_HEADER_LEN: usize = 1 + 8 + 4;
 
 #[derive(Clone, Debug)]
 pub struct WalRecord {
@@ -57,22 +59,26 @@ impl WalManager {
             .create(true)
             .open(path)?;
 
-        let (records, truncated_len) = read_records(&mut file)?;
-        if let Some(valid_len) = truncated_len {
+        let (records, page_bytes, valid_len) = read_records(&mut file)?;
+        let file_len = file.metadata()?.len();
+        if valid_len < file_len {
             file.set_len(valid_len)?;
         }
         file.seek(SeekFrom::End(0))?;
 
         let mut leaf_counts = HashMap::new();
-        let mut total_bytes = 0usize;
+        let total_bytes = valid_len as usize;
         for record in records.iter() {
             let entry = leaf_counts
                 .entry(record.page_id)
                 .or_insert(LeafWalStats { count: 0, bytes: 0 });
             entry.count += 1;
-            let size = record_size(record);
-            entry.bytes = entry.bytes.saturating_add(size);
-            total_bytes = total_bytes.saturating_add(size);
+        }
+        for (page_id, bytes) in page_bytes.into_iter() {
+            leaf_counts
+                .entry(page_id)
+                .and_modify(|stats| stats.bytes = bytes)
+                .or_insert(LeafWalStats { count: 0, bytes });
         }
         let total_records = records.len();
 
@@ -141,20 +147,25 @@ impl WalManager {
 
     fn append_record(&self, record: WalRecord) -> io::Result<()> {
         let mut state = self.state.lock().expect("wal mutex poisoned");
-        let record_len = record_size(&record);
         state.records.push(record.clone());
         state.total_records += 1;
-        state.total_bytes = state
-            .total_bytes
-            .checked_add(record_len)
-            .expect("wal byte counter overflow");
-        let entry = state
+        state
             .leaf_counts
             .entry(record.page_id)
-            .or_insert(LeafWalStats { count: 0, bytes: 0 });
-        entry.count += 1;
-        entry.bytes = entry.bytes.saturating_add(record_len);
-        write_record(&mut state.file, &record)?;
+            .or_insert(LeafWalStats { count: 0, bytes: 0 })
+            .count += 1;
+        let bytes_written = write_group(
+            &mut state.file,
+            record.page_id,
+            std::slice::from_ref(&record),
+        )?;
+        if let Some(entry) = state.leaf_counts.get_mut(&record.page_id) {
+            entry.bytes = entry.bytes.saturating_add(bytes_written);
+        }
+        state.total_bytes = state
+            .total_bytes
+            .checked_add(bytes_written)
+            .expect("wal byte counter overflow");
         state.file.sync_data()?;
         Ok(())
     }
@@ -169,14 +180,15 @@ impl WalManager {
         {
             return Ok(());
         }
-        let removed = state.leaf_counts.remove(&page_key);
         state.records.retain(|record| record.page_id != page_key);
-        if let Some(stats) = removed {
-            state.total_records = state.total_records.saturating_sub(stats.count);
-            state.total_bytes = state.total_bytes.saturating_sub(stats.bytes);
-        }
         let snapshot = state.records.clone();
-        rewrite_records(&mut state.file, &snapshot)?;
+        let stats = rewrite_records(&mut state.file, &snapshot)?;
+        state.leaf_counts = stats;
+        state.total_records = state.records.len();
+        state.total_bytes = state
+            .leaf_counts
+            .values()
+            .fold(0usize, |acc, entry| acc.saturating_add(entry.bytes));
         Ok(())
     }
 
@@ -237,21 +249,56 @@ impl WalManager {
     }
 }
 
-fn rewrite_records(file: &mut File, records: &[WalRecord]) -> io::Result<()> {
+fn rewrite_records(
+    file: &mut File,
+    records: &[WalRecord],
+) -> io::Result<HashMap<u64, LeafWalStats>> {
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
-    for record in records {
-        write_record(file, record)?;
+    let mut stats: HashMap<u64, LeafWalStats> = HashMap::new();
+    let mut idx = 0usize;
+    while idx < records.len() {
+        let page_id = records[idx].page_id;
+        let mut end = idx + 1;
+        while end < records.len() && records[end].page_id == page_id {
+            end += 1;
+        }
+        let bytes_written = write_group(file, page_id, &records[idx..end])?;
+        stats
+            .entry(page_id)
+            .and_modify(|entry| {
+                entry.count += end - idx;
+                entry.bytes = entry.bytes.saturating_add(bytes_written);
+            })
+            .or_insert(LeafWalStats {
+                count: end - idx,
+                bytes: bytes_written,
+            });
+        idx = end;
     }
     file.sync_data()?;
-    Ok(())
+    Ok(stats)
 }
 
-fn write_record(file: &mut File, record: &WalRecord) -> io::Result<()> {
+fn write_group(file: &mut File, page_id: u64, records: &[WalRecord]) -> io::Result<usize> {
+    if records.is_empty() {
+        return Ok(0);
+    }
+    file.write_all(&[GROUP_MARKER])?;
+    file.write_all(&page_id.to_le_bytes())?;
+    let count = u32::try_from(records.len()).expect("record group too large");
+    file.write_all(&count.to_le_bytes())?;
+    let mut payload = 0usize;
+    for record in records {
+        payload += write_record_payload(file, record)?;
+    }
+    Ok(GROUP_HEADER_LEN + payload)
+}
+
+fn write_record_payload(file: &mut File, record: &WalRecord) -> io::Result<usize> {
     match &record.op {
         WalOp::Put { value } => {
             file.write_all(&[RECORD_TYPE_PUT])?;
-            file.write_all(&record.page_id.to_le_bytes())?;
             let key_len = record.key.len() as u32;
             let val_len = value.len() as u32;
             let lower_len = record.lower_fence.len() as u32;
@@ -264,10 +311,17 @@ fn write_record(file: &mut File, record: &WalRecord) -> io::Result<()> {
             file.write_all(value)?;
             file.write_all(&record.lower_fence)?;
             file.write_all(&record.upper_fence)?;
+            Ok(1 + 4
+                + 4
+                + 4
+                + 4
+                + record.key.len()
+                + value.len()
+                + record.lower_fence.len()
+                + record.upper_fence.len())
         }
         WalOp::Tombstone => {
             file.write_all(&[RECORD_TYPE_TOMBSTONE])?;
-            file.write_all(&record.page_id.to_le_bytes())?;
             let key_len = record.key.len() as u32;
             let lower_len = record.lower_fence.len() as u32;
             let upper_len = record.upper_fence.len() as u32;
@@ -277,112 +331,136 @@ fn write_record(file: &mut File, record: &WalRecord) -> io::Result<()> {
             file.write_all(&record.key)?;
             file.write_all(&record.lower_fence)?;
             file.write_all(&record.upper_fence)?;
+            Ok(1 + 4
+                + 4
+                + 4
+                + record.key.len()
+                + record.lower_fence.len()
+                + record.upper_fence.len())
         }
     }
-    Ok(())
 }
 
-fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, Option<u64>)> {
+fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, HashMap<u64, usize>, u64)> {
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     let mut idx = 0usize;
     let mut records = Vec::new();
-    while idx < bytes.len() {
-        let record_start = idx;
-        if bytes.len() - idx < 1 + 8 + 4 {
+    let mut page_bytes: HashMap<u64, usize> = HashMap::new();
+    let mut valid_idx = 0usize;
+
+    'outer: while bytes.len().saturating_sub(idx) >= GROUP_HEADER_LEN {
+        if bytes[idx] != GROUP_MARKER {
             break;
         }
-        let record_type = bytes[idx];
         idx += 1;
         let page_id = u64::from_le_bytes(bytes[idx..idx + 8].try_into().unwrap());
         idx += 8;
-        match record_type {
-            RECORD_TYPE_TOMBSTONE => {
-                if bytes.len() - idx < 12 {
-                    idx = record_start;
-                    break;
-                }
-                let key_len = u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
-                idx += 4;
-                let lower_len =
-                    u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
-                idx += 4;
-                let upper_len =
-                    u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
-                idx += 4;
-                if bytes.len() - idx < key_len + lower_len + upper_len {
-                    idx = record_start;
-                    break;
-                }
-                let key = bytes[idx..idx + key_len].to_vec();
-                idx += key_len;
-                let lower = bytes[idx..idx + lower_len].to_vec();
-                idx += lower_len;
-                let upper = bytes[idx..idx + upper_len].to_vec();
-                idx += upper_len;
-                records.push(WalRecord {
-                    page_id,
-                    key,
-                    lower_fence: lower,
-                    upper_fence: upper,
-                    op: WalOp::Tombstone,
-                });
+        let record_count = u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+        idx += 4;
+
+        let mut payload_bytes = 0usize;
+        let mut parsed = 0usize;
+        while parsed < record_count {
+            if idx >= bytes.len() {
+                break 'outer;
             }
-            RECORD_TYPE_PUT => {
-                if bytes.len() - idx < 16 {
-                    idx = record_start;
-                    break;
+            let record_type = bytes[idx];
+            idx += 1;
+            match record_type {
+                RECORD_TYPE_TOMBSTONE => {
+                    if bytes.len() - idx < 12 {
+                        break 'outer;
+                    }
+                    let key_len =
+                        u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+                    idx += 4;
+                    let lower_len =
+                        u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+                    idx += 4;
+                    let upper_len =
+                        u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+                    idx += 4;
+                    if bytes.len() - idx < key_len + lower_len + upper_len {
+                        break 'outer;
+                    }
+                    let key = bytes[idx..idx + key_len].to_vec();
+                    idx += key_len;
+                    let lower = bytes[idx..idx + lower_len].to_vec();
+                    idx += lower_len;
+                    let upper = bytes[idx..idx + upper_len].to_vec();
+                    idx += upper_len;
+                    let record = WalRecord {
+                        page_id,
+                        key,
+                        lower_fence: lower,
+                        upper_fence: upper,
+                        op: WalOp::Tombstone,
+                    };
+                    payload_bytes = payload_bytes.saturating_add(record_size(&record));
+                    records.push(record);
                 }
-                let key_len = u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
-                idx += 4;
-                let val_len = u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
-                idx += 4;
-                let lower_len =
-                    u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
-                idx += 4;
-                let upper_len =
-                    u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
-                idx += 4;
-                if bytes.len() - idx < key_len + val_len + lower_len + upper_len {
-                    idx = record_start;
-                    break;
+                RECORD_TYPE_PUT => {
+                    if bytes.len() - idx < 16 {
+                        break 'outer;
+                    }
+                    let key_len =
+                        u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+                    idx += 4;
+                    let val_len =
+                        u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+                    idx += 4;
+                    let lower_len =
+                        u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+                    idx += 4;
+                    let upper_len =
+                        u32::from_le_bytes(bytes[idx..idx + 4].try_into().unwrap()) as usize;
+                    idx += 4;
+                    if bytes.len() - idx < key_len + val_len + lower_len + upper_len {
+                        break 'outer;
+                    }
+                    let key = bytes[idx..idx + key_len].to_vec();
+                    idx += key_len;
+                    let value = bytes[idx..idx + val_len].to_vec();
+                    idx += val_len;
+                    let lower = bytes[idx..idx + lower_len].to_vec();
+                    idx += lower_len;
+                    let upper = bytes[idx..idx + upper_len].to_vec();
+                    idx += upper_len;
+                    let record = WalRecord {
+                        page_id,
+                        key,
+                        lower_fence: lower,
+                        upper_fence: upper,
+                        op: WalOp::Put { value },
+                    };
+                    payload_bytes = payload_bytes.saturating_add(record_size(&record));
+                    records.push(record);
                 }
-                let key = bytes[idx..idx + key_len].to_vec();
-                idx += key_len;
-                let value = bytes[idx..idx + val_len].to_vec();
-                idx += val_len;
-                let lower = bytes[idx..idx + lower_len].to_vec();
-                idx += lower_len;
-                let upper = bytes[idx..idx + upper_len].to_vec();
-                idx += upper_len;
-                records.push(WalRecord {
-                    page_id,
-                    key,
-                    lower_fence: lower,
-                    upper_fence: upper,
-                    op: WalOp::Put { value },
-                });
+                _ => {
+                    break 'outer;
+                }
             }
-            _ => {
-                idx = record_start;
-                break;
-            }
+            parsed += 1;
         }
+
+        let group_bytes = GROUP_HEADER_LEN + payload_bytes;
+        page_bytes
+            .entry(page_id)
+            .and_modify(|bytes| *bytes = bytes.saturating_add(group_bytes))
+            .or_insert(group_bytes);
+        valid_idx = idx;
     }
-    let truncated = if idx < bytes.len() {
-        Some(idx as u64)
-    } else {
-        None
-    };
-    Ok((records, truncated))
+
+    let valid_len = valid_idx as u64;
+    Ok((records, page_bytes, valid_len))
 }
 
 fn record_size(record: &WalRecord) -> usize {
     match &record.op {
         WalOp::Put { value } => {
-            1 + 8
-                + 4
+            1 + 4
                 + 4
                 + 4
                 + 4
@@ -392,13 +470,7 @@ fn record_size(record: &WalRecord) -> usize {
                 + record.upper_fence.len()
         }
         WalOp::Tombstone => {
-            1 + 8
-                + 4
-                + 4
-                + 4
-                + record.key.len()
-                + record.lower_fence.len()
-                + record.upper_fence.len()
+            1 + 4 + 4 + 4 + record.key.len() + record.lower_fence.len() + record.upper_fence.len()
         }
     }
 }
