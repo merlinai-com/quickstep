@@ -261,14 +261,32 @@ impl MiniPageBuffer {
 
     /// Deallocate a mini-page, this mini-page must be unused, ie. not appear in the mapping table
     pub unsafe fn dealloc(&self, node: MiniPageIndex) {
-        let node_meta: &NodeMeta = self.get_meta_ref(node);
+        let (size, slot) = {
+            let meta = self.get_meta_mut(node);
+            let node_size = meta.size();
+            meta.set_live(false);
+            meta.clear_eviction();
+            meta.set_record_count(0);
+            (node_size, node.index)
+        };
 
-        // if its in the second chance region, there's no point adding it to a free list
-        if todo!("Is in the second chance region") {
-            // node_meta.
-        } else {
+        let free_head = &self.free_lists[size.index()];
+        let next_cell = &*(self.buffer.as_ptr().add(slot + 1) as *const AtomicU64);
+        let mut head = free_head.load(Ordering::Acquire);
+        loop {
+            next_cell.store(head as u64, Ordering::Release);
+            match free_head.compare_exchange_weak(
+                head,
+                slot,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(actual) => {
+                    head = actual;
+                }
+            }
         }
-        let size = node_meta.size();
     }
 
     pub unsafe fn get_meta_ptr(&self, index: usize) -> *mut NodeMeta {

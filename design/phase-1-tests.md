@@ -67,6 +67,8 @@ Each subsection lists three things:
 
 ### Current results
 - **PASS** – `tests/quickstep_fence_keys.rs` exercises root splits, merge survivors, eviction flushes, and delete-triggered auto merges using the public API. Each scenario asserts the lower/upper fences still cover the resident keys (including the sentinel `[0x00]/[0xFF]` root case). Command: `cargo test quickstep_fence_keys`. Compiler warnings remain (unused imports/todo stubs) but do not affect correctness.
+- **PASS (2025-11-23)** – `cargo test quickstep_split` verifies the instrumentation-backed split suite after the cascading-split loop landed (`QuickStepTx::put` now retries via `split_current_leaf`). No regressions observed; warnings unchanged from earlier runs.
+- **PASS (2025-11-23)** – `tests/mini_page_buffer.rs::dealloc_reuses_slot_via_freelist` confirms freed mini-pages rejoin the freelist and are reused on the next allocation (`cargo test mini_page_buffer`). Only longstanding warnings remain.
 
 ---
 
@@ -98,16 +100,14 @@ Each subsection lists three things:
 - Validate both commit and abort semantics as well as basic concurrency.
 
 ### Implementation details
-- Create `tests/quickstep_tx.rs`.
-- Test cases:
-  1. **Commit**: begin tx → put → commit → new tx → get returns value.
-  2. **Abort**: begin tx → put → abort → new tx → get returns `None`.
-  3. **Concurrency**: spawn two threads with independent transactions writing disjoint keys; both should commit successfully and be readable afterwards.
-  4. **Stress loop** (optional but desirable): randomised sequence of puts/gets/aborts/commits compared against an in-memory `BTreeMap`.
-- Use `std::sync::Arc` and `std::thread` for concurrency tests.
+- `QuickStepTx` now carries an explicit `TxState`: `commit()` marks the transaction committed (undo log cleared) while `Drop`/`abort()` replay the undo log, append an abort marker, and leave the tree untouched.
+- Added `tests/quickstep_tx.rs` with two foundational cases:
+  1. **Explicit abort**: begin tx → put → abort → new tx → get returns `None`.
+  2. **Implicit RAII abort**: begin tx → put → drop (no commit) → get returns `None`.
+- Remaining stretch goals (still TODO): multi-threaded concurrency test plus a stress-harness that randomises puts/gets/aborts/commits against an in-memory oracle once undo-aware checkpoints are in place.
 
 ### Current results
-- **Pending** – transaction commit/abort logic still TODO.
+- **PASS (2025-11-23)** – `cargo test quickstep_tx` exercises the new abort semantics (explicit + RAII). Existing warnings remain due to unfinished modules elsewhere.
 
 ---
 

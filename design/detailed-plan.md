@@ -87,6 +87,7 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
         * Steps: clone the source page into the destination, call `reset_user_entries` on both leaves, replay the retained entries into the left page and the moved entries into the right page via the existing `try_put` path, then surface the separator key via `LeafSplitOutcome`.
         * Result: Two valid leaves containing disjoint halves of the original user entries plus the pivot key we need for the parent update (child wiring still todo).
       - ✅ Reworked the lock manager to hand out stable write-guard handles so we can keep the original leaf locked while allocating/promoting the new right-hand mini-page.
+      - ✅ `QuickStepTx::put` now loops until success: the new `split_current_leaf` helper allocates a sibling, rewires parents, and returns whichever leaf still owns the key so cascading splits no longer hit `todo!()`.
    3. Parent/root updates:
       - ✅ Taught `BPTree` a `promote_leaf_root` helper that allocates a fresh inner node, installs the pivot + child pointers, and swaps the root pointer under the root write-lock.
       - ✅ Added `ChildPointer` + `LockedInner` tracking so every ancestor write lock knows its tree level and child IDs (leaf vs inner). This keeps wiring unambiguous when a split cascades.
@@ -101,6 +102,7 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
       - ✅ Defined eviction/liveness bitfields on `NodeMeta` so mini-pages can be marked in-flight, converted back to disk leaves, and reclaimed deterministically.
       - ✅ Added `page_op::flush_dirty_entries` and taught `MiniPageBuffer::evict` to invoke it, flip the map-table entry back to `NodeRef::Leaf`, advance the circular-buffer head, and log eviction events.
       - ✅ `QuickStepTx::new_mini_page` now retries failed allocations by driving eviction, so splits and cascading inserts can proceed even when the cache is saturated.
+      - ✅ Freed mini-pages now re-enter size-tier freelists via `MiniPageBuffer::dealloc`; `tests/mini_page_buffer.rs::dealloc_reuses_slot_via_freelist` (`cargo test mini_page_buffer`) proves the reclaimed slot is reused immediately.
 
    5. Merge planning (next up)
       - ☐ **Trigger semantics**: merges will be initiated after deletes when a leaf drops below a configurable occupancy threshold (default 25%). Until delete exists, we surface an internal helper to exercise the merge machinery via tests.
@@ -171,6 +173,14 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
 ### 1.4.4 – Rollout
 1. Land the format + replay changes behind a feature branch, run the full `quickstep_delete_persist` suite, and explicitly record the before/after behaviour in `CODING_HISTORY.md`.
 2. Once stable, trim the old fence-sentinel code and update the operator docs with the new guarantees (fence metadata logged per leaf, WAL grouped per page). Finish by marking 1.4 as “Complete” in this plan.
+
+---
+
+## 1.5 – Transaction durability (In progress)
+
+1. ✅ `QuickStepTx` tracks an explicit `TxState` so `commit()` marks the transaction committed (after appending the WAL marker) and `Drop` becomes a no-op; `abort()` (and `Drop` for forgotten handles) replays the undo log, appends an abort marker, and clears internal state so in-flight writes never leak into the tree.
+2. ✅ Added `tests/quickstep_tx.rs` covering explicit abort plus the “drop without commit” path. Command: `cargo test quickstep_tx` (passes with the usual pre-existing warnings).
+3. ☐ Follow-up: add the concurrency/stress harness outlined earlier (multi-threaded puts/gets/aborts) once undo-aware checkpoints (Section 2.3) land, so we can validate RAII abort semantics under real contention.
 
 ---
 

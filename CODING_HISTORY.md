@@ -1,6 +1,20 @@
 # Coding History
-
 # Coding History
+
+#### 2025-11-23 00:05 UTC [pending] [main]
+
+- Closed the cascading split gap: `QuickStepTx::put` now loops until success via `split_current_leaf`, which applies the split, updates parents, and hands back whichever leaf should receive the key. The helper relies on the new `lock_bundle_for_split` wrapper so every retry acquires fresh overflow-point locks before mutating the tree.
+- Documentation/test updates: `design/detailed-plan.md` and `design/phase-1-tests.md` note the change and the `cargo test quickstep_split` run (PASS, warnings unchanged).
+
+#### 2025-11-23 00:25 UTC [pending] [main]
+
+- Added `TxState` tracking to `QuickStepTx`, implemented RAII abort semantics (drop now replays undo + logs abort markers), and made `commit()` clear undo logs before marking the transaction committed.
+- New regression suite `tests/quickstep_tx.rs` verifies explicit abort and drop-without-commit flows via `cargo test quickstep_tx` (PASS, known warnings persist). Updated the detailed plan/test doc to document the new coverage.
+
+#### 2025-11-23 00:40 UTC [pending] [main]
+
+- Wired `MiniPageBuffer::dealloc` into the freelist path so evicted pages are reset and reused immediately; added `tests/mini_page_buffer.rs` to prove freelist recycling works (`cargo test mini_page_buffer`).
+- README + design docs updated to reflect the new coverage.
 
 #### 2025-11-22 19:45 UTC [pending] [main]
 

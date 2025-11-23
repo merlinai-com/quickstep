@@ -1,10 +1,32 @@
 # Changelog
-
+# Changelog
+# Changelog
 # Changelog
 
-# Changelog
+#### 2025-11-23 00:05 UTC [pending] [main]
 
-# Changelog
+##### Phase 1.3 cascading split completion
+
+- `QuickStepTx::put` now loops until success via the new `split_current_leaf` helper, eliminating the `todo!()` that previously aborted when a leaf required an immediate second split.
+- `lock_bundle_for_split` centralises overflow-point locking so each retry observes the latest tree topology before reattempting the insert.
+- Documentation: `design/detailed-plan.md` Implementation plan §1.3.2 describes the retry loop; `design/phase-1-tests.md` logs the 2025-11-23 `cargo test quickstep_split` run that validated the change.
+- Tests: `cargo test quickstep_split` (PASS, existing warnings unchanged).
+
+#### 2025-11-23 00:25 UTC [pending] [main]
+
+##### Phase 1.5 transaction durability baseline
+
+- `QuickStepTx` tracks an explicit `TxState`; `commit()` now marks the transaction committed (undo log cleared) before drop, while `abort()` and `Drop` replay queued undo actions and append a WAL abort marker so forgotten handles no longer leak writes.
+- Added `tests/quickstep_tx.rs` covering both explicit aborts and the implicit RAII abort path. Command: `cargo test quickstep_tx` (PASS, longstanding warnings unchanged).
+- Documentation: `design/detailed-plan.md` now includes §1.5; `design/phase-1-tests.md` records the new test suite and its 2025-11-23 run.
+
+#### 2025-11-23 00:40 UTC [pending] [main]
+
+##### Phase 1.3 mini-page recycling + test
+
+- `MiniPageBuffer::dealloc` now resets freed mini-pages, clears eviction state, and pushes the slot back onto the appropriate freelist so future allocations reuse existing backing storage.
+- Added `tests/mini_page_buffer.rs::dealloc_reuses_slot_via_freelist`; `cargo test mini_page_buffer` verifies the recycled slot is returned immediately.
+- Documentation: `design/detailed-plan.md` (cache eviction section), `design/phase-1-tests.md`, and README status bullets now reflect the freelist recycling + test coverage.
 
 #### 2025-11-22 19:45 UTC [pending] [main]
 

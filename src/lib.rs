@@ -70,6 +70,14 @@ pub struct QuickStep {
     next_txn_id: AtomicU64,
 }
 
+impl<'db> Drop for QuickStepTx<'db> {
+    fn drop(&mut self) {
+        if self.state == TxState::Active {
+            self.abort_in_place();
+        }
+    }
+}
+
 const AUTO_MERGE_MIN_ENTRIES: usize = 3;
 const DEFAULT_WAL_LEAF_CHECKPOINT_THRESHOLD: usize = 32;
 const DEFAULT_WAL_GLOBAL_RECORD_THRESHOLD: usize = 1024;
@@ -285,6 +293,7 @@ impl QuickStep {
             txn_id,
             wal_entry_kind: WalEntryKind::Redo,
             undo_log: Vec::new(),
+            state: TxState::Active,
         }
     }
 }
@@ -516,7 +525,15 @@ pub struct QuickStepTx<'db> {
     txn_id: u64,
     wal_entry_kind: WalEntryKind,
     undo_log: Vec<UndoAction>,
+    state: TxState,
     // changes for rollback
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum TxState {
+    Active,
+    Committed,
+    Aborted,
 }
 
 #[derive(Debug)]
@@ -548,99 +565,61 @@ impl<'db> QuickStepTx<'db> {
 
     /// Insert or update a value
     pub fn put<'tx>(&'tx mut self, key: &[u8], val: &[u8]) -> Result<(), QSError> {
-        // find leaf, keep track of those that would need to be written to in a split
         let res = self.db.inner_nodes.read_traverse_leaf(key)?;
 
-        // We've found the page now get a write lock, keeping in mind we might already have one of some kind
         let mut page_guard = self
             .lock_manager
             .get_upgrade_or_acquire_write_lock(&self.db.map_table, res.page)?;
 
         let undo_value = Self::existing_value(self.db, &mut page_guard, key);
-        match Self::try_put_with_promotion(self.db, &mut page_guard, key, val)? {
-            TryPutResult::Success => {
-                self.append_wal_put(&mut page_guard, key, val, undo_value.clone())?;
-                self.maybe_global_checkpoint()?;
-                return Ok(());
-            }
-            TryPutResult::NeedsSplit => {
-                // We know which locks we need, so try to acquire them, if we fail then it might
-                // be because another thread modified the tree which we weren't looking, so we should restart
-                let split_plan = Self::plan_leaf_split(self.db, &mut page_guard);
 
-                let lock_bundle =
-                    self.db
-                        .inner_nodes
-                        .write_lock(res.overflow_point, OpType::Split, key);
-
-                let mut lock_bundle = match lock_bundle {
-                    Ok(l) => l,
-                    Err(e) => return Err(e),
-                };
-
-                let mut right_guard = self.new_mini_page(NodeSize::LeafPage, None)?;
-
-                let split_outcome = Self::apply_leaf_split(
-                    self.db,
-                    &mut page_guard,
-                    &mut right_guard,
-                    &split_plan,
-                )?;
-
-                debug::record_split_event(
-                    page_guard.page_id().0,
-                    right_guard.page_id().0,
-                    split_outcome.pivot_key.clone(),
-                    split_outcome.left_count,
-                    split_outcome.right_count,
-                );
-
-                self.insert_into_parents_after_leaf_split(
-                    &mut lock_bundle,
-                    page_guard.page_id(),
-                    &split_outcome.pivot_key,
-                    right_guard.page_id(),
-                )?;
-
-                let pivot = split_outcome.pivot_key.as_slice();
-                let target_guard = if key >= pivot {
-                    &mut right_guard
-                } else {
-                    &mut page_guard
-                };
-
-                match Self::try_put_with_promotion(self.db, target_guard, key, val)? {
-                    TryPutResult::Success => {
-                        self.append_wal_put(target_guard, key, val, undo_value.clone())?;
-                        self.maybe_global_checkpoint()?;
-                        return Ok(());
-                    }
-                    TryPutResult::NeedsSplit => {
-                        todo!("split cascading is not yet implemented");
-                    }
-                    TryPutResult::NeedsPromotion(_) => {
-                        unreachable!("promotion handled before returning")
-                    }
+        loop {
+            match Self::try_put_with_promotion(self.db, &mut page_guard, key, val)? {
+                TryPutResult::Success => {
+                    self.append_wal_put(&mut page_guard, key, val, undo_value.clone())?;
+                    self.maybe_global_checkpoint()?;
+                    return Ok(());
                 }
+                TryPutResult::NeedsSplit => {
+                    page_guard = self.split_current_leaf(page_guard, key)?;
+                }
+                TryPutResult::NeedsPromotion(_) => unreachable!("promotion handled before returning"),
             }
-            TryPutResult::NeedsPromotion(_) => unreachable!("promotion handled before returning"),
         }
     }
 
     pub fn abort(mut self) {
+        self.abort_in_place();
+    }
+
+    pub fn commit(mut self) {
+        self.commit_in_place();
+    }
+
+    fn commit_in_place(&mut self) {
+        if self.state != TxState::Active {
+            return;
+        }
+        self.db
+            .wal
+            .append_txn_marker(WalTxnMarker::Commit, self.wal_entry_kind, self.txn_id)
+            .expect("failed to record txn commit");
+        self.undo_log.clear();
+        self.state = TxState::Committed;
+    }
+
+    fn abort_in_place(&mut self) {
+        if self.state != TxState::Active {
+            return;
+        }
         self.apply_undo_actions()
             .expect("failed to roll back transaction");
         self.db
             .wal
             .append_txn_marker(WalTxnMarker::Abort, self.wal_entry_kind, self.txn_id)
             .expect("failed to record txn abort");
-    }
-
-    pub fn commit(self) {
-        self.db
-            .wal
-            .append_txn_marker(WalTxnMarker::Commit, self.wal_entry_kind, self.txn_id)
-            .expect("failed to record txn commit");
+        self.undo_log.clear();
+        self.state = TxState::Aborted;
     }
 }
 
@@ -696,6 +675,61 @@ impl<'db> QuickStepTx<'db> {
             }
             NodeRef::Leaf(_) => unreachable!("leaf splits only apply to cached mini-pages"),
         }
+    }
+
+    fn split_current_leaf(
+        &mut self,
+        mut left_guard: WriteGuardWrapper<'db>,
+        key: &[u8],
+    ) -> Result<WriteGuardWrapper<'db>, QSError> {
+        let (mut lock_bundle, page_id) = self.lock_bundle_for_split(key)?;
+        debug_assert_eq!(
+            page_id,
+            left_guard.page_id(),
+            "split lock bundle must reference active leaf"
+        );
+
+        let mut right_guard = self.new_mini_page(NodeSize::LeafPage, None)?;
+        let split_plan = Self::plan_leaf_split(self.db, &mut left_guard);
+
+        let split_outcome =
+            Self::apply_leaf_split(self.db, &mut left_guard, &mut right_guard, &split_plan)?;
+
+        debug::record_split_event(
+            left_guard.page_id().0,
+            right_guard.page_id().0,
+            split_outcome.pivot_key.clone(),
+            split_outcome.left_count,
+            split_outcome.right_count,
+        );
+
+        self.insert_into_parents_after_leaf_split(
+            &mut lock_bundle,
+            left_guard.page_id(),
+            &split_outcome.pivot_key,
+            right_guard.page_id(),
+        )?;
+
+        let pivot_key = split_outcome.pivot_key.clone();
+        if key >= pivot_key.as_slice() {
+            drop(left_guard);
+            Ok(right_guard)
+        } else {
+            drop(right_guard);
+            Ok(left_guard)
+        }
+    }
+
+    fn lock_bundle_for_split(
+        &self,
+        key: &[u8],
+    ) -> Result<(WriteLockBundle<'db>, PageId), QSError> {
+        let res = self.db.inner_nodes.read_traverse_leaf(key)?;
+        let bundle = self
+            .db
+            .inner_nodes
+            .write_lock(res.overflow_point, OpType::Split, key)?;
+        Ok((bundle, res.page))
     }
 
     fn append_wal_put(

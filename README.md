@@ -89,16 +89,14 @@ cargo doc --open
 
 - Put/get operations (mini-page promotion + cache writes are in place; cascading parent splits bubble to the root and publish new map-table entries immediately, while merge/eviction policies are still being fleshed out)
 - Leaf split logic (Phase 1.3 now exercises root splits, cascading inner splits, and root promotions via instrumentation-backed integration tests; remaining work focuses on merge handling)
-- Buffer eviction (baseline FIFO eviction flushes dirty mini-pages back to disk and updates the map table in place; second-chance policy & mixed-size freelists are still TODO)
+- Buffer eviction (baseline FIFO eviction flushes dirty mini-pages back to disk, map-table entries are updated in place, and freed pages re-enter the freelists; second-chance policy & eviction analytics remain TODO)
 - Delete/merge path (delete API now logs tombstones through the WAL, replays them during restart, triggers per-leaf checkpoints, and auto-merges underfilled siblings; range deletes + multi-level recovery semantics remain TODO)
 - Merge logic (leaf-level merge plan, parent rewiring, root demotion, and merge instrumentation are implemented; delete-triggered thresholds and non-root cascading merges are still outstanding)
-- Buffer eviction (structure present, merge-to-disk incomplete)
 - I/O engine (read/write path works; WAL still lacks redo/undo for complex transactions and finer-grained checkpoint orchestration)
 - WAL crash recovery now relies on logical `PageId`s with length-prefixed page groups. Remaining work focuses on broader eviction/replay regression coverage and documenting the new on-disk framing plus redo/undo requirements (see `design/detailed-plan.md` §1.4/§2.3).
 
 ### ❌ Not Yet Implemented
 
-- Transaction commit/abort
 - Full redo/undo logging for values beyond delete tombstones + crash-safe checkpoints
 - Range queries
 
