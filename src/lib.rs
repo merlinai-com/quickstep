@@ -356,6 +356,38 @@ impl QuickStep {
         Ok(snapshot)
     }
 
+    /// Returns all key/value pairs with `lower <= key < upper`, sorted by key.
+    pub fn range_scan(
+        &self,
+        lower: &[u8],
+        upper: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, QSError> {
+        if upper <= lower {
+            return Ok(Vec::new());
+        }
+        let mut results = Vec::new();
+        for slot in 0..self.map_table.capacity() {
+            let page_id = PageId(slot as u64);
+            if !self.map_table.has_entry(page_id) {
+                continue;
+            }
+            let guard = self.map_table.read_page_entry(page_id)?;
+            match guard.node() {
+                NodeRef::MiniPage(index) => {
+                    let meta = unsafe { self.cache.get_meta_ref(index) };
+                    results.extend(records_between(meta, lower, upper));
+                }
+                NodeRef::Leaf(addr) => {
+                    let leaf = self.io_engine.get_page(addr);
+                    let meta = leaf.as_ref();
+                    results.extend(records_between(meta, lower, upper));
+                }
+            }
+        }
+        results.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(results)
+    }
+
     pub fn debug_leaf_fences(&self, page_id: PageId) -> Result<DebugLeafFences, QSError> {
         let guard = self.map_table.read_page_entry(page_id)?;
         let (disk_addr, lower, upper) = match guard.node() {
@@ -1302,6 +1334,13 @@ fn collect_user_records(meta: &NodeMeta) -> Vec<(Vec<u8>, Vec<u8>)> {
             key.extend_from_slice(entry.key_suffix);
             (key, entry.value.to_vec())
         })
+        .collect()
+}
+
+fn records_between(meta: &NodeMeta, lower: &[u8], upper: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    collect_user_records(meta)
+        .into_iter()
+        .filter(|(key, _)| key.as_slice() >= lower && key.as_slice() < upper)
         .collect()
 }
 

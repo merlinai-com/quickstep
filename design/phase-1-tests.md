@@ -113,6 +113,20 @@ Each subsection lists three things:
 
 ---
 
+## 4.1 – Range scan API
+
+### Outline
+- Provide a read helper that surfaces sorted key/value pairs across multiple leaves while honouring the fence bounds, so HelixDB-style traversals can stream ordered rows.
+
+### Implementation details
+- Added `QuickStep::range_scan(lower, upper)` which walks every mapped leaf (cached or on disk), filters entries within `[lower, upper)`, sorts the combined output, and returns owned `Vec<(Vec<u8>, Vec<u8>)>` results. Internally this reuses the existing `collect_user_records` helper so fence keys remain excluded.
+- `tests/quickstep_range.rs` covers both single-leaf and multi-leaf (post-split) ranges to ensure ordering and bounds are enforced.
+
+### Current results
+- **PASS (2025-11-23)** – `cargo test quickstep_range` exercises both range scenarios. Legacy warnings (unused imports, deprecated `TempDir::into_path`) remain unchanged.
+
+---
+
 ## Exit Criteria
 
 - **Passing tests**: every subsection must have a corresponding `cargo test …` invocation with a PASS outcome recorded above.

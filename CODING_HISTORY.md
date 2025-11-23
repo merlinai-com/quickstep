@@ -26,6 +26,11 @@
 - Implemented a WAL manifest header that stores the durable checkpoint LSN; checkpoints now rewrite the WAL after the manifest area, update `checkpoint_len`, and persist the header before resuming appends.
 - Added `tests/wal_manifest.rs` (`cargo test wal_manifest`) to assert the manifest never exceeds the WAL length and advances after `debug_flush_root_leaf`. Docs (README, plan, phase-1 tests, changelog) note the new coverage.
 
+#### 2025-11-23 02:10 UTC [pending] [main]
+
+- Added `QuickStep::range_scan(lower, upper)` which walks each mapped leaf (cached or on-disk), filters entries within `[lower, upper)`, sorts the combined results, and returns owned key/value pairs.
+- Added `tests/quickstep_range.rs` (`cargo test quickstep_range`) to cover single-leaf and cross-split ranges; updated README + design docs with the new API/test coverage.
+
 #### 2025-11-22 19:45 UTC [pending] [main]
 
 - Reworked WAL logging/replay to operate on logical `PageId`s only: `WalRecord` dropped `disk_addr`, writer/reader now batch records per page (`records_grouped()`), checkpoints/key stats accept `PageId`, and `QuickStepTx::append_wal_put/delete` log fences + payloads via the new API before calling `checkpoint_page`.

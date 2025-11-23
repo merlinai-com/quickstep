@@ -44,6 +44,14 @@
 - Updated WAL replay to skip the manifest area, ensured checkpoints reset the file to `MANIFEST_LEN` before rewriting, and added `tests/wal_manifest.rs::wal_manifest_tracks_checkpoint_len_after_flush` (`cargo test wal_manifest`) to verify the manifest never exceeds WAL length and advances after a manual flush.
 - Documentation: README “Implemented” list, `design/detailed-plan.md` §2.3, `design/phase-1-tests.md`, and `CODING_HISTORY.md` describe the manifest/redo work.
 
+#### 2025-11-23 02:10 UTC [pending] [main]
+
+##### Range scan helper
+
+- Added `QuickStep::range_scan(lower, upper)` which gathers ordered key/value pairs across all mapped leaves (cached or on disk) while filtering by `[lower, upper)` bounds.
+- New `tests/quickstep_range.rs` covers single-leaf and split-leaf scenarios; run via `cargo test quickstep_range`.
+- Documentation updates: README Implemented list, `design/detailed-plan.md` §4.1, and `design/phase-1-tests.md` now describe the range API and test coverage.
+
 #### 2025-11-22 19:45 UTC [pending] [main]
 
 ##### Phase 1.4 PageId WAL logging + replay

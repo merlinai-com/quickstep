@@ -85,6 +85,7 @@ cargo doc --open
 - WAL records are grouped per logical `PageId`, checkpoints operate on `checkpoint_page(PageId)`, and startup replay hydrates both disk and cached leaves before flushing; the merge-crash regression runs entirely through the public API.
 - WAL records are grouped per logical `PageId`, and crash replay reinstalls each leaf’s `[lower, upper]` bounds plus the sorted key/value set before writing back to disk; the merge-crash regression now passes via public operations only.
 - WAL manifest header tracks the durable checkpoint LSN, ensuring crash recovery replays only the portion beyond the last successful checkpoint (`tests/wal_manifest.rs`).
+- Range scan helper (`QuickStep::range_scan`) streams ordered key/value pairs across cached and on-disk leaves (see `tests/quickstep_range.rs`).
 
 ### ⚠️ Partially Implemented
 

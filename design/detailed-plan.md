@@ -186,6 +186,20 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
 ---
 
 ## 2.3 – WAL redo/undo + durable checkpoints (Outline)
+---
+
+## 4.1 – Range scan API (Planned)
+
+1. Define a public iterator surface on `QuickStep` (e.g. `range(lower: &[u8], upper: &[u8]) -> QuickStepRange<'_>`) that respects fence bounds, maintains mini-page pins while iterating, and degrades to disk reads when a leaf is not cached.
+2. Add a debug-only “range snapshot” helper so tests can assert that fence/pivot metadata remains consistent with iterator output.
+3. Testing strategy:
+   - Unit tests that traverse single-leaf ranges, multi-leaf ranges, and empty bounds.
+   - Integration tests that combine inserts, splits/merges, and range scans to ensure iterator correctness under structural changes.
+   - Property-style harness comparing iterator output against a `BTreeMap` oracle for random workloads (ties into concurrency/stress plan).
+
+Dependencies: requires the existing fence instrumentation, stable WAL replay (to rehydrate fence metadata), and the planned undo-aware checkpoints so iterators over freshly restarted nodes see consistent ordering.
+
+---
 
 **Goal:** build on the PageId-based WAL to support crash-safe commits (redo) and in-flight rollback (undo) while keeping checkpoints deterministic.
 
