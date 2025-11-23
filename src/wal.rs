@@ -5,6 +5,7 @@ use std::{
     path::Path,
     sync::Mutex,
 };
+use std::convert::TryInto;
 
 use crate::map_table::PageId;
 
@@ -16,6 +17,9 @@ const RECORD_TYPE_TXN_ABORT: u8 = 4;
 pub const TXN_META_PAGE_ID: u64 = u64::MAX;
 const GROUP_MARKER: u8 = 0xAA;
 const GROUP_HEADER_LEN: usize = 1 + 8 + 4;
+const MANIFEST_MAGIC: [u8; 4] = *b"WALM";
+const MANIFEST_VERSION: u32 = 1;
+const MANIFEST_LEN: u64 = 32;
 
 #[derive(Clone, Debug)]
 pub struct WalRecord {
@@ -88,12 +92,26 @@ struct LeafWalStats {
     bytes: usize,
 }
 
+#[derive(Clone, Copy)]
+struct WalManifest {
+    checkpoint_len: u64,
+}
+
+impl WalManifest {
+    fn new() -> WalManifest {
+        WalManifest {
+            checkpoint_len: MANIFEST_LEN,
+        }
+    }
+}
+
 struct WalState {
     file: File,
     records: Vec<WalRecord>,
     leaf_counts: HashMap<u64, LeafWalStats>,
     total_records: usize,
     total_bytes: usize,
+    manifest: WalManifest,
 }
 
 pub struct WalManager {
@@ -114,10 +132,16 @@ impl WalManager {
             .create(true)
             .open(path)?;
 
+        let mut manifest = read_manifest(&mut file)?;
         let (records, page_bytes, valid_len) = read_records(&mut file)?;
         let file_len = file.metadata()?.len();
         if valid_len < file_len {
             file.set_len(valid_len)?;
+        }
+        if manifest.checkpoint_len > valid_len {
+            manifest.checkpoint_len = valid_len;
+            write_manifest(&mut file, manifest)?;
+            file.sync_data()?;
         }
         file.seek(SeekFrom::End(0))?;
 
@@ -144,6 +168,7 @@ impl WalManager {
                 leaf_counts,
                 total_records,
                 total_bytes,
+                manifest,
             }),
         })
     }
@@ -227,6 +252,7 @@ impl WalManager {
 
     fn append_record(&self, record: WalRecord) -> io::Result<()> {
         let mut state = self.state.lock().expect("wal mutex poisoned");
+        state.file.seek(SeekFrom::End(0))?;
         state.records.push(record.clone());
         state.total_records += 1;
         state
@@ -269,6 +295,11 @@ impl WalManager {
             .leaf_counts
             .values()
             .fold(0usize, |acc, entry| acc.saturating_add(entry.bytes));
+        state.manifest.checkpoint_len = MANIFEST_LEN + state.total_bytes as u64;
+        let manifest = state.manifest;
+        write_manifest(&mut state.file, manifest)?;
+        state.file.sync_data()?;
+        state.file.seek(SeekFrom::End(0))?;
         Ok(())
     }
 
@@ -278,9 +309,12 @@ impl WalManager {
         state.leaf_counts.clear();
         state.total_records = 0;
         state.total_bytes = 0;
-        state.file.set_len(0)?;
+        state.manifest = WalManifest::new();
+        let manifest = state.manifest;
+        state.file.set_len(MANIFEST_LEN)?;
+        write_manifest(&mut state.file, manifest)?;
         state.file.sync_data()?;
-        state.file.seek(SeekFrom::Start(0))?;
+        state.file.seek(SeekFrom::End(0))?;
         Ok(())
     }
 
@@ -334,8 +368,8 @@ fn rewrite_records(
     file: &mut File,
     records: &[WalRecord],
 ) -> io::Result<HashMap<u64, LeafWalStats>> {
-    file.set_len(0)?;
-    file.seek(SeekFrom::Start(0))?;
+    file.set_len(MANIFEST_LEN)?;
+    file.seek(SeekFrom::Start(MANIFEST_LEN))?;
     let mut stats: HashMap<u64, LeafWalStats> = HashMap::new();
     let mut idx = 0usize;
     while idx < records.len() {
@@ -440,7 +474,7 @@ fn write_record_payload(file: &mut File, record: &WalRecord) -> io::Result<usize
 }
 
 fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, HashMap<u64, usize>, u64)> {
-    file.seek(SeekFrom::Start(0))?;
+    file.seek(SeekFrom::Start(MANIFEST_LEN))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     let mut idx = 0usize;
@@ -577,7 +611,7 @@ fn read_records(file: &mut File) -> io::Result<(Vec<WalRecord>, HashMap<u64, usi
         valid_idx = idx;
     }
 
-    let valid_len = valid_idx as u64;
+    let valid_len = MANIFEST_LEN + valid_idx as u64;
     Ok((records, page_bytes, valid_len))
 }
 
@@ -607,4 +641,38 @@ fn record_size(record: &WalRecord) -> usize {
         }
         WalOp::TxnMarker(_) => 1 + 8 + 1,
     }
+}
+
+fn read_manifest(file: &mut File) -> io::Result<WalManifest> {
+    let mut manifest = WalManifest::new();
+    let len = file.metadata()?.len();
+    if len < MANIFEST_LEN {
+        file.set_len(MANIFEST_LEN)?;
+        write_manifest(file, manifest)?;
+        file.sync_data()?;
+        return Ok(manifest);
+    }
+    let mut header = [0u8; MANIFEST_LEN as usize];
+    file.seek(SeekFrom::Start(0))?;
+    file.read_exact(&mut header)?;
+    if &header[0..4] != MANIFEST_MAGIC || u32::from_le_bytes(header[4..8].try_into().unwrap()) != MANIFEST_VERSION {
+        write_manifest(file, manifest)?;
+        file.sync_data()?;
+        return Ok(manifest);
+    }
+    manifest.checkpoint_len =
+        u64::from_le_bytes(header[8..16].try_into().unwrap()).max(MANIFEST_LEN);
+    Ok(manifest)
+}
+
+fn write_manifest(file: &mut File, manifest: WalManifest) -> io::Result<()> {
+    let mut buf = [0u8; MANIFEST_LEN as usize];
+    buf[0..4].copy_from_slice(&MANIFEST_MAGIC);
+    buf[4..8].copy_from_slice(&MANIFEST_VERSION.to_le_bytes());
+    buf[8..16].copy_from_slice(&manifest.checkpoint_len.to_le_bytes());
+    let current = file.seek(SeekFrom::Current(0))?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&buf)?;
+    file.seek(SeekFrom::Start(current))?;
+    Ok(())
 }

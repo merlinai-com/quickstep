@@ -70,6 +70,7 @@ Each subsection lists three things:
 - **PASS (2025-11-23)** – `cargo test quickstep_split` verifies the instrumentation-backed split suite after the cascading-split loop landed (`QuickStepTx::put` now retries via `split_current_leaf`). No regressions observed; warnings unchanged from earlier runs.
 - **PASS (2025-11-23)** – `tests/mini_page_buffer.rs::dealloc_reuses_slot_via_freelist` confirms freed mini-pages rejoin the freelist and are reused on the next allocation (`cargo test mini_page_buffer`). Only longstanding warnings remain.
 - **PASS (2025-11-23)** – `tests/quickstep_eviction.rs::second_chance_clears_hot_pages_before_eviction` runs alongside the existing eviction test via `cargo test quickstep_eviction`, asserting `debug::second_chance_passes()` increases once the ref-bit path kicks in.
+- **PASS (2025-11-23)** – `cargo test wal_manifest` ensures the WAL manifest header exists, never reports a checkpoint length beyond the WAL file, and monotonically advances after a manual flush (`wal_manifest_tracks_checkpoint_len_after_flush`).
 
 ---
 

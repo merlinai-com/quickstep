@@ -196,18 +196,24 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
 
 ### 2.3.2 – Proposed approach
 1. Extend `WalRecord` with an op-type enum (`RedoPut`, `RedoDelete`, `UndoPut`, `UndoDelete`) plus transaction IDs once txn semantics exist. Redo entries stay grouped per `PageId`; undo entries can be grouped per txn.
-2. Introduce a WAL manifest or “checkpoint LSN” so we can truncate only the fully applied segments while keeping redo/undo ordering intact.
+2. Introduce a WAL manifest (small fixed-size header + monotonic `lsn`) that records:
+   - `checkpoint_lsn`: byte offset up to which redo records have been applied and the data file is crash-safe.
+   - `pending_undo`: manifest entry pointing at the oldest txn that still needs undo replay (if any).
+   - Per-page/high-water metadata so recovery can skip already-applied segments.
+   This manifest lives at the start of the `.wal` file and is fsynced atomically before truncation.
 3. Checkpoint protocol:
-   - Acquire write locks for dirty pages, flush them to disk, emit a `CheckpointComplete {page_ids}` record, then fsync both data + WAL.
-   - After success, drop WAL groups up to the checkpoint LSN.
+   - Acquire write locks for dirty pages, flush them to disk, emit a `CheckpointComplete {page_ids, lsn}` record, then fsync both data + WAL.
+   - Update the manifest’s `checkpoint_lsn` to the highest fully flushed group, fsync the manifest, and only then truncate WAL groups below that LSN.
 4. Recovery steps:
-   - Replay redo groups per page (as we do now).
-   - Scan undo sections for any txn without a corresponding commit marker and roll those back before opening for writes.
+   - Read the manifest first to determine the `checkpoint_lsn`.
+   - Replay redo groups per page for segments ≥ `checkpoint_lsn` (as we do now) while rebuilding the in-memory LSN map.
+   - Scan undo sections for any txn without a corresponding commit marker and roll those back before opening for writes; use the manifest’s `pending_undo` pointer to limit the scope.
 
 ### 2.3.3 – Dependencies / open questions
 1. Needs transactional metadata (`QuickStepTx` commit markers, txn IDs).
 2. Requires eviction to surface dirty-page lists so checkpoints can batch flushes efficiently.
 3. Decide whether undo lives in the main WAL or a side log (TBD in Phase 2).
+4. Testing plan: create fixture WAL files with interleaved redo/undo segments, manifest checkpoints, and partial truncations to ensure recovery honors `checkpoint_lsn`.
 
 ### 2.3.4 – Current progress (22 Nov 2025)
 1. ✅ `WalRecord` now encodes `WalEntryKind` (redo/undo placeholder) and a 64-bit `txn_id` so future undo logging can reuse the existing serializer/deserializer.

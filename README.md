@@ -84,6 +84,7 @@ cargo doc --open
 - Fence guards derived from parent pivots via `QuickStep::debug_leaf_fences`, with integration tests (`tests/quickstep_fence_keys.rs`) that verify page 0 uses the sentinel `[0x00]`/`[0xFF]` bounds while split children, merge survivors, eviction-flushed leaves, and delete-triggered auto-merge survivors maintain monotonic lower/upper fences that cover their user keys; WAL entries now embed those fence bounds so crash replay reinstalls the same ranges before applying writes
 - WAL records are grouped per logical `PageId`, checkpoints operate on `checkpoint_page(PageId)`, and startup replay hydrates both disk and cached leaves before flushing; the merge-crash regression runs entirely through the public API.
 - WAL records are grouped per logical `PageId`, and crash replay reinstalls each leaf’s `[lower, upper]` bounds plus the sorted key/value set before writing back to disk; the merge-crash regression now passes via public operations only.
+- WAL manifest header tracks the durable checkpoint LSN, ensuring crash recovery replays only the portion beyond the last successful checkpoint (`tests/wal_manifest.rs`).
 
 ### ⚠️ Partially Implemented
 

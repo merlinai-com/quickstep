@@ -21,6 +21,11 @@
 - Added ref-bit tracking to `NodeMeta`, hooked it up to writes/promotions, and taught the eviction loop to clear the bit on the first pass while logging the “second chance” via the debug counter.
 - New regression `tests/quickstep_eviction.rs::second_chance_clears_hot_pages_before_eviction` exercises the counter (`cargo test quickstep_eviction`). README + design docs mention the instrumentation.
 
+#### 2025-11-23 01:45 UTC [pending] [main]
+
+- Implemented a WAL manifest header that stores the durable checkpoint LSN; checkpoints now rewrite the WAL after the manifest area, update `checkpoint_len`, and persist the header before resuming appends.
+- Added `tests/wal_manifest.rs` (`cargo test wal_manifest`) to assert the manifest never exceeds the WAL length and advances after `debug_flush_root_leaf`. Docs (README, plan, phase-1 tests, changelog) note the new coverage.
+
 #### 2025-11-22 19:45 UTC [pending] [main]
 
 - Reworked WAL logging/replay to operate on logical `PageId`s only: `WalRecord` dropped `disk_addr`, writer/reader now batch records per page (`records_grouped()`), checkpoints/key stats accept `PageId`, and `QuickStepTx::append_wal_put/delete` log fences + payloads via the new API before calling `checkpoint_page`.

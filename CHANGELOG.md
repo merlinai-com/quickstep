@@ -36,6 +36,14 @@
 - `debug::second_chance_passes()` exposes the counter; `tests/quickstep_eviction.rs::second_chance_clears_hot_pages_before_eviction` exercises the path (`cargo test quickstep_eviction`).
 - Documentation: updated `design/detailed-plan.md`, `design/phase-1-tests.md`, and README to mention the ref-bit instrumentation and new regression coverage.
 
+#### 2025-11-23 01:45 UTC [pending] [main]
+
+##### Phase 1.4 WAL manifest + regression
+
+- Added a fixed-size manifest header at the front of `.wal` files that tracks the durable checkpoint LSN; every checkpoint rewrites the WAL, updates the manifest, and persists the header before truncation.
+- Updated WAL replay to skip the manifest area, ensured checkpoints reset the file to `MANIFEST_LEN` before rewriting, and added `tests/wal_manifest.rs::wal_manifest_tracks_checkpoint_len_after_flush` (`cargo test wal_manifest`) to verify the manifest never exceeds WAL length and advances after a manual flush.
+- Documentation: README “Implemented” list, `design/detailed-plan.md` §2.3, `design/phase-1-tests.md`, and `CODING_HISTORY.md` describe the manifest/redo work.
+
 #### 2025-11-22 19:45 UTC [pending] [main]
 
 ##### Phase 1.4 PageId WAL logging + replay
