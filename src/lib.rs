@@ -7,7 +7,7 @@
 //! [design documentation](../design/).
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     env,
     path::{Path, PathBuf},
     ptr,
@@ -433,7 +433,7 @@ impl QuickStep {
         }
 
         let txn_meta = grouped.remove(&TXN_META_PAGE_ID).unwrap_or_default();
-        let committed = self.committed_txn_ids(&txn_meta);
+        let statuses = self.txn_statuses(&txn_meta);
 
         for (page_key, records) in grouped.into_iter() {
             let page_id = PageId(page_key);
@@ -445,7 +445,22 @@ impl QuickStep {
             }
             let mut lower: Option<Vec<u8>> = None;
             let mut upper: Option<Vec<u8>> = None;
-            let mut entries: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+            let guard = self
+                .map_table
+                .read_page_entry(page_id)
+                .expect("WAL replay requires mapped page");
+            let node_ref = guard.node();
+            let disk_addr = match node_ref {
+                NodeRef::Leaf(addr) => addr,
+                NodeRef::MiniPage(idx) => unsafe { self.cache.get_meta_ref(idx) }.leaf(),
+            };
+
+            let mut disk_leaf = self.io_engine.get_page(disk_addr);
+            let base_meta = disk_leaf.as_ref();
+            let (base_lower, base_upper) = collect_fence_keys(base_meta);
+            let mut entries: BTreeMap<Vec<u8>, Vec<u8>> =
+                collect_user_records(base_meta).into_iter().collect();
 
             for record in records {
                 let WalRecord {
@@ -458,44 +473,33 @@ impl QuickStep {
                     op,
                     ..
                 } = record;
-                if matches!(kind, WalEntryKind::Undo) {
+                if matches!(op, WalOp::TxnMarker(_)) {
                     continue;
                 }
-                if let Some(committed) = committed.as_ref() {
-                    if !committed.contains(&txn_id) {
-                        continue;
-                    }
+                let committed = matches!(statuses.get(&txn_id), Some(TxStatus::Committed));
+                let apply = match kind {
+                    WalEntryKind::Redo => committed,
+                    WalEntryKind::Undo => !committed,
+                };
+                if !apply {
+                    continue;
                 }
                 lower = Some(record_lower);
                 upper = Some(record_upper);
-                match op {
-                    WalOp::Tombstone => {
-                        entries.remove(&key);
-                    }
-                    WalOp::Put { value } => {
-                        entries.insert(key, value);
-                    }
-                    WalOp::TxnMarker(_) => continue,
-                }
+                apply_wal_op(&mut entries, key, op);
+            }
+
+            if entries.is_empty() {
+                continue;
             }
 
             let (lower_fence, upper_fence) = match (lower, upper) {
                 (Some(l), Some(u)) => (l, u),
-                _ => continue,
-            };
-
-            let guard = self
-                .map_table
-                .read_page_entry(page_id)
-                .expect("WAL replay requires mapped page");
-            let node_ref = guard.node();
-            let disk_addr = match node_ref {
-                NodeRef::Leaf(addr) => addr,
-                NodeRef::MiniPage(idx) => unsafe { self.cache.get_meta_ref(idx) }.leaf(),
+                _ => (base_lower, base_upper),
             };
 
             {
-                let mut leaf = self.io_engine.get_page(disk_addr);
+                let leaf = &mut disk_leaf;
                 {
                     let meta = leaf.as_mut();
                     meta.reset_user_entries_with_fences(&lower_fence, &upper_fence);
@@ -506,7 +510,7 @@ impl QuickStep {
                     )
                     .expect("disk leaf should accept WAL replay");
                 }
-                self.io_engine.write_page(disk_addr, &leaf);
+                self.io_engine.write_page(disk_addr, &disk_leaf);
             }
 
             if let NodeRef::MiniPage(idx) = node_ref {
@@ -523,27 +527,22 @@ impl QuickStep {
         self.wal.clear().expect("failed to clear WAL after replay");
     }
 
-    fn committed_txn_ids(&self, txn_meta: &[WalRecord]) -> Option<HashSet<u64>> {
-        if txn_meta.is_empty() {
-            return None;
-        }
-        let mut latest: HashMap<u64, WalTxnMarker> = HashMap::new();
+    fn txn_statuses(&self, txn_meta: &[WalRecord]) -> HashMap<u64, TxStatus> {
+        let mut statuses = HashMap::new();
         for record in txn_meta {
             if let WalOp::TxnMarker(marker) = &record.op {
-                latest.insert(record.txn_id, *marker);
+                match marker {
+                    WalTxnMarker::Commit => {
+                        statuses.insert(record.txn_id, TxStatus::Committed);
+                    }
+                    WalTxnMarker::Abort => {
+                        statuses.insert(record.txn_id, TxStatus::Aborted);
+                    }
+                    WalTxnMarker::Begin => {}
+                }
             }
         }
-        if latest.is_empty() {
-            return None;
-        }
-        let committed: HashSet<u64> = latest
-            .into_iter()
-            .filter_map(|(txn_id, marker)| match marker {
-                WalTxnMarker::Commit => Some(txn_id),
-                _ => None,
-            })
-            .collect();
-        Some(committed)
+        statuses
     }
 
     pub fn debug_wal_record_count(&self) -> usize {
@@ -579,6 +578,12 @@ enum UndoAction {
         page_id: PageId,
         key: Vec<u8>,
     },
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum TxStatus {
+    Committed,
+    Aborted,
 }
 
 impl<'db> QuickStepTx<'db> {
@@ -1342,6 +1347,18 @@ fn records_between(meta: &NodeMeta, lower: &[u8], upper: &[u8]) -> Vec<(Vec<u8>,
         .into_iter()
         .filter(|(key, _)| key.as_slice() >= lower && key.as_slice() < upper)
         .collect()
+}
+
+fn apply_wal_op(entries: &mut BTreeMap<Vec<u8>, Vec<u8>>, key: Vec<u8>, op: WalOp) {
+    match op {
+        WalOp::Put { value } => {
+            entries.insert(key, value);
+        }
+        WalOp::Tombstone => {
+            entries.remove(&key);
+        }
+        WalOp::TxnMarker(_) => {}
+    }
 }
 
 impl QuickStep {

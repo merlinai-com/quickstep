@@ -42,6 +42,7 @@
 
 - Added a fixed-size manifest header at the front of `.wal` files that tracks the durable checkpoint LSN; every checkpoint rewrites the WAL, updates the manifest, and persists the header before truncation.
 - Updated WAL replay to skip the manifest area, ensured checkpoints reset the file to `MANIFEST_LEN` before rewriting, and added `tests/wal_manifest.rs::wal_manifest_tracks_checkpoint_len_after_flush` (`cargo test wal_manifest`) to verify the manifest never exceeds WAL length and advances after a manual flush.
+- Replay now distinguishes committed vs pending transactions: redo entries apply only for committed txns, while undo payloads roll back anything else. Regression `tests/wal_manifest.rs::wal_replay_discards_uncommitted_transactions` simulates a crash mid-transaction and confirms pending keys vanish on reopen.
 - Documentation: README “Implemented” list, `design/detailed-plan.md` §2.3, `design/phase-1-tests.md`, and `CODING_HISTORY.md` describe the manifest/redo work.
 
 #### 2025-11-23 02:10 UTC [pending] [main]
