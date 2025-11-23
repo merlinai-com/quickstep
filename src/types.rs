@@ -223,6 +223,7 @@ const SPLIT_BIT: u64 = 1 << 9;
 const LIVE_BIT: u64 = 1 << 10;
 const FREELIST_BIT: u64 = 1 << 11;
 const EVICT_BIT: u64 = 1 << 12;
+const HOT_BIT: u64 = 1 << 13;
 
 impl NodeMeta {
     // pub unsafe fn from_repr(repr: u64) -> NodeMeta {
@@ -305,6 +306,18 @@ impl NodeMeta {
 
     pub fn clear_eviction(&mut self) {
         self.set_being_evicted(false);
+    }
+
+    pub fn is_hot(&self) -> bool {
+        (self.0 & HOT_BIT) != 0
+    }
+
+    pub fn mark_hot(&mut self) {
+        self.set_flag(HOT_BIT, true);
+    }
+
+    pub fn clear_hot(&mut self) {
+        self.set_flag(HOT_BIT, false);
     }
 
     #[inline]

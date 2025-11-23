@@ -16,6 +16,11 @@
 - Wired `MiniPageBuffer::dealloc` into the freelist path so evicted pages are reset and reused immediately; added `tests/mini_page_buffer.rs` to prove freelist recycling works (`cargo test mini_page_buffer`).
 - README + design docs updated to reflect the new coverage.
 
+#### 2025-11-23 01:05 UTC [pending] [main]
+
+- Added ref-bit tracking to `NodeMeta`, hooked it up to writes/promotions, and taught the eviction loop to clear the bit on the first pass while logging the “second chance” via the debug counter.
+- New regression `tests/quickstep_eviction.rs::second_chance_clears_hot_pages_before_eviction` exercises the counter (`cargo test quickstep_eviction`). README + design docs mention the instrumentation.
+
 #### 2025-11-22 19:45 UTC [pending] [main]
 
 - Reworked WAL logging/replay to operate on logical `PageId`s only: `WalRecord` dropped `disk_addr`, writer/reader now batch records per page (`records_grouped()`), checkpoints/key stats accept `PageId`, and `QuickStepTx::append_wal_put/delete` log fences + payloads via the new API before calling `checkpoint_page`.

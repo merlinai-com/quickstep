@@ -69,6 +69,7 @@ Each subsection lists three things:
 - **PASS** – `tests/quickstep_fence_keys.rs` exercises root splits, merge survivors, eviction flushes, and delete-triggered auto merges using the public API. Each scenario asserts the lower/upper fences still cover the resident keys (including the sentinel `[0x00]/[0xFF]` root case). Command: `cargo test quickstep_fence_keys`. Compiler warnings remain (unused imports/todo stubs) but do not affect correctness.
 - **PASS (2025-11-23)** – `cargo test quickstep_split` verifies the instrumentation-backed split suite after the cascading-split loop landed (`QuickStepTx::put` now retries via `split_current_leaf`). No regressions observed; warnings unchanged from earlier runs.
 - **PASS (2025-11-23)** – `tests/mini_page_buffer.rs::dealloc_reuses_slot_via_freelist` confirms freed mini-pages rejoin the freelist and are reused on the next allocation (`cargo test mini_page_buffer`). Only longstanding warnings remain.
+- **PASS (2025-11-23)** – `tests/quickstep_eviction.rs::second_chance_clears_hot_pages_before_eviction` runs alongside the existing eviction test via `cargo test quickstep_eviction`, asserting `debug::second_chance_passes()` increases once the ref-bit path kicks in.
 
 ---
 

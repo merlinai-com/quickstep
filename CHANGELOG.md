@@ -28,6 +28,14 @@
 - Added `tests/mini_page_buffer.rs::dealloc_reuses_slot_via_freelist`; `cargo test mini_page_buffer` verifies the recycled slot is returned immediately.
 - Documentation: `design/detailed-plan.md` (cache eviction section), `design/phase-1-tests.md`, and README status bullets now reflect the freelist recycling + test coverage.
 
+#### 2025-11-23 01:05 UTC [pending] [main]
+
+##### Phase 1.3 second-chance eviction instrumentation
+
+- Added a ref-bit (“hot”) flag to `NodeMeta`, set on mini-page writes/promotions and cleared once the second-chance pass runs. `MiniPageBuffer::evict` now skips hot pages on the first encounter, logs the pass via `debug::record_second_chance`, and only evicts after the bit is cleared.
+- `debug::second_chance_passes()` exposes the counter; `tests/quickstep_eviction.rs::second_chance_clears_hot_pages_before_eviction` exercises the path (`cargo test quickstep_eviction`).
+- Documentation: updated `design/detailed-plan.md`, `design/phase-1-tests.md`, and README to mention the ref-bit instrumentation and new regression coverage.
+
 #### 2025-11-22 19:45 UTC [pending] [main]
 
 ##### Phase 1.4 PageId WAL logging + replay

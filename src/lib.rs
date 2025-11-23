@@ -1009,6 +1009,7 @@ impl<'db> QuickStepTx<'db> {
                 "disk leaf for page {} missing fence keys",
                 logical_page.0
             );
+            node_meta.mark_hot();
         }
 
         Ok(())

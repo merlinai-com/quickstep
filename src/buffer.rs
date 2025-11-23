@@ -210,6 +210,14 @@ impl MiniPageBuffer {
                 continue;
             }
 
+            if meta.is_hot() {
+                meta.clear_hot();
+                debug::record_second_chance();
+                eviction_cand = self.wrap(eviction_cand + chunk_words);
+                scanned += chunk_words;
+                continue;
+            }
+
             let page_id = meta.page_id();
             let mut guard = match map_table.write_page_entry(page_id) {
                 Ok(g) => g,
@@ -266,6 +274,7 @@ impl MiniPageBuffer {
             let node_size = meta.size();
             meta.set_live(false);
             meta.clear_eviction();
+            meta.clear_hot();
             meta.set_record_count(0);
             (node_size, node.index)
         };

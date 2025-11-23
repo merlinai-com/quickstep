@@ -299,7 +299,10 @@ impl<'a> WriteGuardWrapper<'a> {
                 // SAFETY: we hold the write lock for this node
                 let node_meta = unsafe { cache.get_meta_mut(mini_page_index) };
                 match node_meta.try_put(key, val) {
-                    Ok(_) => TryPutResult::Success,
+                    Ok(_) => {
+                        node_meta.mark_hot();
+                        TryPutResult::Success
+                    }
                     Err(_) => TryPutResult::NeedsSplit,
                 }
             }

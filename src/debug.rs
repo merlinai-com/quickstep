@@ -26,6 +26,7 @@ static MERGE_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static EVICTION_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static SPLIT_EVENTS: Mutex<Vec<SplitEvent>> = Mutex::new(Vec::new());
 static MERGE_EVENTS: Mutex<Vec<MergeEvent>> = Mutex::new(Vec::new());
+static SECOND_CHANCE_PASSES: AtomicU64 = AtomicU64::new(0);
 
 pub fn record_split_event(
     left_page: u64,
@@ -50,6 +51,10 @@ pub fn record_eviction() {
     EVICTION_REQUESTS.fetch_add(1, Ordering::Relaxed);
 }
 
+pub fn record_second_chance() {
+    SECOND_CHANCE_PASSES.fetch_add(1, Ordering::Relaxed);
+}
+
 pub fn record_merge_event(survivor_page: u64, removed_page: u64, merged_count: usize) {
     MERGE_REQUESTS.fetch_add(1, Ordering::Relaxed);
     if let Ok(mut guard) = MERGE_EVENTS.lock() {
@@ -65,6 +70,7 @@ pub fn reset_debug_counters() {
     SPLIT_REQUESTS.store(0, Ordering::Relaxed);
     MERGE_REQUESTS.store(0, Ordering::Relaxed);
     EVICTION_REQUESTS.store(0, Ordering::Relaxed);
+    SECOND_CHANCE_PASSES.store(0, Ordering::Relaxed);
     let mut guard = match SPLIT_EVENTS.lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
@@ -90,6 +96,10 @@ pub fn split_events() -> Vec<SplitEvent> {
 
 pub fn evictions() -> u64 {
     EVICTION_REQUESTS.load(Ordering::Relaxed)
+}
+
+pub fn second_chance_passes() -> u64 {
+    SECOND_CHANCE_PASSES.load(Ordering::Relaxed)
 }
 
 pub fn merge_requests() -> u64 {

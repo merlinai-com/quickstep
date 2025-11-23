@@ -103,6 +103,7 @@ Thus Option A (promotion inside `QuickStepTx::put`) is the selected path.
       - ✅ Added `page_op::flush_dirty_entries` and taught `MiniPageBuffer::evict` to invoke it, flip the map-table entry back to `NodeRef::Leaf`, advance the circular-buffer head, and log eviction events.
       - ✅ `QuickStepTx::new_mini_page` now retries failed allocations by driving eviction, so splits and cascading inserts can proceed even when the cache is saturated.
       - ✅ Freed mini-pages now re-enter size-tier freelists via `MiniPageBuffer::dealloc`; `tests/mini_page_buffer.rs::dealloc_reuses_slot_via_freelist` (`cargo test mini_page_buffer`) proves the reclaimed slot is reused immediately.
+      - ✅ Added second-chance instrumentation: hot mini-pages set a ref bit on writes/promotions; eviction now clears the bit on the first pass, records the skip via `debug::record_second_chance`, and only evicts on the next visit. `tests/quickstep_eviction.rs::second_chance_clears_hot_pages_before_eviction` (`cargo test quickstep_eviction`) ensures the counter increments when eviction runs.
 
    5. Merge planning (next up)
       - ☐ **Trigger semantics**: merges will be initiated after deletes when a leaf drops below a configurable occupancy threshold (default 25%). Until delete exists, we surface an internal helper to exercise the merge machinery via tests.
